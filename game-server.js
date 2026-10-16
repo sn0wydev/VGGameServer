@@ -632,6 +632,34 @@ app.post('/admin/users/:id/ton-paid', adminAuth, wrap(async (req, res) => {
   const r = await pool.query(`INSERT INTO users (user_id, ton_paid) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET ton_paid = $2 RETURNING *`, [req.params.id, ton]);
   res.json({ user_id: req.params.id, access: promoAccess(r.rows[0]) });
 }));
+// Support / testing tool: give an account Stars, coins and/or a gift (e.g. an NFT to test claiming on dev).
+// Every grant is written to the ledger. Set ADMIN_GRANTS=off to switch this route off entirely.
+app.post('/admin/users/:id/grant', adminAuth, wrap(async (req, res) => {
+  if (String(process.env.ADMIN_GRANTS || 'on').toLowerCase() === 'off') throw fail(403, 'GRANTS_OFF', 'Admin grants are switched off (ADMIN_GRANTS=off)');
+  if (!/^\d{1,15}$/.test(req.params.id)) throw fail(400, 'BAD_ID', 'Bad user id');
+  const b = req.body || {};
+  const stars = Number(b.stars || 0), coins = Number(b.coins || 0);
+  const okInt = (n) => Number.isInteger(n) && n >= 0 && n <= 10000000;
+  if (!okInt(stars) || !okInt(coins)) throw fail(400, 'BAD_VALUE', 'stars and coins must be whole numbers between 0 and 10,000,000');
+  const gift = b.gift ? String(b.gift) : '';
+  if (gift && !GIFT_NAMES.has(gift)) throw fail(400, 'BAD_GIFT', 'Unknown gift name');
+  if (!stars && !coins && !gift) throw fail(400, 'NOTHING', 'Give stars, coins or a gift');
+  const note = b.note ? String(b.note).slice(0, 200) : null;
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const u = (await c.query(
+      `INSERT INTO users (user_id, stars, coins) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id) DO UPDATE SET stars = users.stars + $2, coins = users.coins + $3, updated_at = NOW() RETURNING *`,
+      [req.params.id, stars, coins])).rows[0];
+    let prize_id = null;
+    if (gift) prize_id = await createGift(c, { id: req.params.id, username: u.username }, gift);
+    await addLedger(c, req.params.id, 'admin:grant', stars, coins, { gift, prize_id, note },
+      `admin:${req.params.id}:${Date.now()}:${crypto.randomInt(1e6)}`);
+    await c.query('COMMIT');
+    res.json({ user_id: req.params.id, stars: Number(u.stars), coins: Number(u.coins), prize_id });
+  } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
+}));
 app.get('/admin/users/:id', adminAuth, wrap(async (req, res) => {
   const u = (await pool.query('SELECT * FROM users WHERE user_id = $1', [req.params.id])).rows[0];
   const l = (await pool.query('SELECT * FROM ledger WHERE user_id = $1 ORDER BY id DESC LIMIT 30', [req.params.id])).rows;
@@ -660,6 +688,9 @@ table{width:100%;border-collapse:collapse;margin-top:14px}th,td{text-align:left;
 <div class="card"><b>Who can redeem promocodes</b> <small>Accounts unlock automatically after paying the required TON; use this to allow or block someone by hand.</small>
 <div class="row"><label>Telegram user id<input id="u_id" placeholder="123456789" style="min-width:180px"></label><button id="u_check">Check</button><button class="ok" id="u_allow">Allow</button><button class="danger" id="u_block">Block</button><button id="u_auto">Back to automatic</button><small id="u_msg"></small></div>
 <div class="row"><label>Allow many (ids separated by spaces / commas / new lines)<textarea id="u_bulk" rows="2" style="min-width:320px"></textarea></label><button class="ok" id="u_bulkgo">Allow all listed</button></div></div>
+<div class="card"><b>Give an account Stars / a gift</b> <small>For testing and support. Every grant is logged. The gift is added to their inventory as a normal prize (ready to claim).</small>
+<div class="row"><label>Telegram user id<input id="g_id" placeholder="123456789" style="min-width:180px"></label><label>Stars<input id="g_stars" type="number" min="0" value="0" style="width:100px"></label><label>Coins<input id="g_coins" type="number" min="0" value="0" style="width:100px"></label>
+<label>Gift<select id="g_gift"><option value="">— none —</option></select></label><button class="ok" id="g_go">Give</button><small id="g_msg"></small></div></div>
 <table><thead><tr><th>Code</th><th>Status</th><th>Rewards</th><th>Uses</th><th>Window</th><th></th></tr></thead><tbody id="rows"></tbody></table>
 <script>
 const $=id=>document.getElementById(id);let K=sessionStorage.getItem('k')||'';$('key').value=K;
@@ -667,7 +698,7 @@ const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'Content-Type'
 const say=(t,bad)=>{$('msg').textContent=t;$('msg').style.color=bad?'#ff9db5':'#7dffb0'};
 const fmt=d=>d?new Date(d).toLocaleString():'—';
 async function load(){K=$('key').value.trim();sessionStorage.setItem('k',K);try{const j=await api('GET','/admin/promos');
- if($('f_gift').options.length<2)j.valid_gifts.forEach(g=>$('f_gift').add(new Option(g,g)));
+ if($('f_gift').options.length<2)j.valid_gifts.forEach(g=>{$('f_gift').add(new Option(g,g));$('g_gift').add(new Option(g,g))});
  $('rows').innerHTML=j.promos.map(p=>{const rw=[p.coins>0?p.coins+' coins':'',p.stars>0?p.stars+' ⭐':'',...(p.gifts||[])].filter(Boolean).join(', ');
  return '<tr><td><b>'+p.code+'</b><br><small>'+(p.note||'')+'</small></td><td><span class="tag '+p.status+'">'+p.status.replace('_',' ')+'</span></td><td>'+rw+'</td><td>'+p.uses+(p.max_uses!=null?' / '+p.max_uses:'')+'</td><td><small>'+fmt(p.starts_at)+' →<br>'+fmt(p.expires_at)+'</small></td><td class="acts">'
  +(p.active?'<button data-a="off" data-c="'+p.code+'">Disable</button>':'<button class="ok" data-a="on" data-c="'+p.code+'">Enable</button>')
@@ -689,6 +720,8 @@ const accTxt=a=>(a.allowed?'CAN redeem':'cannot redeem')+' ('+a.reason.replace('
 $('u_check').onclick=async()=>{K=$('key').value.trim();try{const j=await api('GET','/admin/users/'+uid());umsg(j.user?accTxt(j.promo_access):'user not found',!j.user)}catch(e){umsg(e.message,1)}};
 for(const [id,v] of [['u_allow',true],['u_block',false],['u_auto',null]])$(id).onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+uid()+'/promo-access',{allowed:v});umsg(accTxt(j.access))}catch(e){umsg(e.message,1)}};
 $('u_bulkgo').onclick=async()=>{K=$('key').value.trim();try{const ids=$('u_bulk').value.split(/[\\s,;]+/).filter(Boolean);const j=await api('POST','/admin/promo-access/bulk',{user_ids:ids,allowed:true});umsg('Allowed '+j.updated+' accounts')}catch(e){umsg(e.message,1)}};
+const gmsg=(t,bad)=>{$('g_msg').textContent=t;$('g_msg').style.color=bad?'#ff9db5':'#7dffb0'};
+$('g_go').onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+$('g_id').value.trim()+'/grant',{stars:+$('g_stars').value,coins:+$('g_coins').value,gift:$('g_gift').value});gmsg('Done. Balance now '+j.stars+' ⭐, '+j.coins+' coins'+(j.prize_id?'. Prize '+j.prize_id:''))}catch(e){gmsg(e.message,1)}};
 if(K)load();
 </script></body></html>`;
 
