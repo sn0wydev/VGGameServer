@@ -83,6 +83,9 @@ const GIFT_NAMES = new Set(Object.keys(CFG.coinValues));
 const NFT_SET = new Set(CFG.nftGifts);
 const DAILY_MS = Math.round((CFG.dailyCooldownHours || 24) * 3600 * 1000);
 
+// Scheduled bot messages (daily gift ready / comeback nudges) - see notifications.js
+const notifier = require('./notifications').createNotifier({ pool, botToken: BOT_TOKEN, dailyMs: DAILY_MS });
+
 // ---------------------------------------------------------------------------
 // Telegram initData verification (same algorithm the bot and relayer use)
 // ---------------------------------------------------------------------------
@@ -134,6 +137,7 @@ function auth(req, res, next) {
   const user = verifyInitData(req.get('x-telegram-init-data'));
   if (!user) return res.status(401).json({ error: 'Invalid or expired Telegram session', code: 'UNAUTHORIZED' });
   req.user = user;
+  notifier.touch(user);
   next();
 }
 const wrap = (fn) => (req, res) => fn(req, res).catch((err) => {
@@ -327,7 +331,7 @@ async function claimExternalCredits(tgUser, initData) {
   }
   if (TON_API_URL) {
     try {
-      const r = await fetch(`${TON_API_URL}/ton/claim-credits/${tgUser.id}`, { signal: AbortSignal.timeout(6000) });
+      const r = await fetch(`${TON_API_URL}/ton/claim-credits/${tgUser.id}`, { headers: { 'x-internal-key': process.env.INTERNAL_API_KEY || '' }, signal: AbortSignal.timeout(6000) });
       if (r.ok) {
         const d = await r.json();
         if (d.stars > 0) entries.push({ stars: Math.trunc(d.stars), ref: `ton:${tgUser.id}:${Date.now()}` });
@@ -393,6 +397,7 @@ async function loadState(userId) {
   return {
     balance: u ? bal(u) : { stars: 0, coins: 0, stars_spent: 0 },
     show_in_leaderboard: u ? u.show_in_leaderboard : true,
+    notify_enabled: u ? u.notify_enabled !== false : true,
     promo: promoAccess(u || {}),
     daily: { ready: remaining === 0, remaining_ms: remaining, last_at: last || null },
     inventory: inv.map((r) => ({
@@ -421,9 +426,11 @@ app.post('/api/credits/claim', auth, limit('credits', 20, 10000), wrap(async (re
 
 app.post('/api/profile', auth, limit('profile', 10, 10000), wrap(async (req, res) => {
   const show = req.body && typeof req.body.show_in_leaderboard === 'boolean' ? req.body.show_in_leaderboard : null;
+  const notify = req.body && typeof req.body.notify_enabled === 'boolean' ? req.body.notify_enabled : null;
   await tx(async (c) => {
     await lockUser(c, req.user);
     if (show !== null) await c.query('UPDATE users SET show_in_leaderboard = $2 WHERE user_id = $1', [req.user.id, show]);
+    if (notify !== null) await c.query('UPDATE users SET notify_enabled = $2 WHERE user_id = $1', [req.user.id, notify]);
   });
   res.json({ ok: true });
 }));
@@ -575,6 +582,27 @@ app.get('/admin/promos', adminAuth, wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM promocodes ORDER BY created_at DESC');
   res.json({ valid_gifts: [...GIFT_NAMES], promos: rows.map((p) => ({ ...p, status: promoStatus(p) })) });
 }));
+// The main bot tells us which language a player picked in /start (en | ru). Used for the scheduled messages.
+// Header x-internal-key = INTERNAL_API_KEY (same secret as the other services). 503 if unset, 401 if wrong.
+app.post('/internal/user-lang', wrap(async (req, res) => {
+  const KEY = process.env.INTERNAL_API_KEY;
+  if (!KEY) throw fail(503, 'NOT_CONFIGURED', 'INTERNAL_API_KEY not set');
+  const given = Buffer.from(String(req.get('x-internal-key') || '')), want = Buffer.from(KEY);
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) throw fail(401, 'UNAUTHORIZED', 'Unauthorized');
+  const id = Number((req.body || {}).user_id), lang = String((req.body || {}).lang || '');
+  if (!Number.isSafeInteger(id) || id <= 0 || !require('./notifications').CHOICES.includes(lang)) throw fail(400, 'BAD_REQUEST', 'user_id and lang (en|ru) required');
+  await pool.query('INSERT INTO users (user_id, lang_pref) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET lang_pref = $2', [id, lang]);
+  res.json({ ok: true });
+}));
+
+// Send a test bot message to one player: body { kind: 'daily' | 'nudge' }. Also GET-able counters via /admin/notify/run.
+app.post('/admin/users/:id/notify-test', adminAuth, wrap(async (req, res) => {
+  const r = await notifier.sendTest(req.params.id, (req.body || {}).kind);
+  res.status(r.ok ? 200 : 502).json(r);
+}));
+// Run the scheduler once right now (handy after changing a user's daily_last_at in the database).
+app.post('/admin/notify/run', adminAuth, wrap(async (req, res) => { res.json(await notifier.tick()); }));
+
 app.post('/admin/promos', adminAuth, wrap(async (req, res) => {
   const p = parsePromoBody(req.body || {});
   const r = await pool.query(
@@ -632,6 +660,34 @@ app.post('/admin/users/:id/ton-paid', adminAuth, wrap(async (req, res) => {
   const r = await pool.query(`INSERT INTO users (user_id, ton_paid) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET ton_paid = $2 RETURNING *`, [req.params.id, ton]);
   res.json({ user_id: req.params.id, access: promoAccess(r.rows[0]) });
 }));
+// Support / testing tool: give an account Stars, coins and/or a gift (e.g. an NFT to test claiming on dev).
+// Every grant is written to the ledger. Set ADMIN_GRANTS=off to switch this route off entirely.
+app.post('/admin/users/:id/grant', adminAuth, wrap(async (req, res) => {
+  if (String(process.env.ADMIN_GRANTS || 'on').toLowerCase() === 'off') throw fail(403, 'GRANTS_OFF', 'Admin grants are switched off (ADMIN_GRANTS=off)');
+  if (!/^\d{1,15}$/.test(req.params.id)) throw fail(400, 'BAD_ID', 'Bad user id');
+  const b = req.body || {};
+  const stars = Number(b.stars || 0), coins = Number(b.coins || 0);
+  const okInt = (n) => Number.isInteger(n) && n >= 0 && n <= 10000000;
+  if (!okInt(stars) || !okInt(coins)) throw fail(400, 'BAD_VALUE', 'stars and coins must be whole numbers between 0 and 10,000,000');
+  const gift = b.gift ? String(b.gift) : '';
+  if (gift && !GIFT_NAMES.has(gift)) throw fail(400, 'BAD_GIFT', 'Unknown gift name');
+  if (!stars && !coins && !gift) throw fail(400, 'NOTHING', 'Give stars, coins or a gift');
+  const note = b.note ? String(b.note).slice(0, 200) : null;
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const u = (await c.query(
+      `INSERT INTO users (user_id, stars, coins) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id) DO UPDATE SET stars = users.stars + $2, coins = users.coins + $3, updated_at = NOW() RETURNING *`,
+      [req.params.id, stars, coins])).rows[0];
+    let prize_id = null;
+    if (gift) prize_id = await createGift(c, { id: req.params.id, username: u.username }, gift);
+    await addLedger(c, req.params.id, 'admin:grant', stars, coins, { gift, prize_id, note },
+      `admin:${req.params.id}:${Date.now()}:${crypto.randomInt(1e6)}`);
+    await c.query('COMMIT');
+    res.json({ user_id: req.params.id, stars: Number(u.stars), coins: Number(u.coins), prize_id });
+  } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
+}));
 app.get('/admin/users/:id', adminAuth, wrap(async (req, res) => {
   const u = (await pool.query('SELECT * FROM users WHERE user_id = $1', [req.params.id])).rows[0];
   const l = (await pool.query('SELECT * FROM ledger WHERE user_id = $1 ORDER BY id DESC LIMIT 30', [req.params.id])).rows;
@@ -660,6 +716,9 @@ table{width:100%;border-collapse:collapse;margin-top:14px}th,td{text-align:left;
 <div class="card"><b>Who can redeem promocodes</b> <small>Accounts unlock automatically after paying the required TON; use this to allow or block someone by hand.</small>
 <div class="row"><label>Telegram user id<input id="u_id" placeholder="123456789" style="min-width:180px"></label><button id="u_check">Check</button><button class="ok" id="u_allow">Allow</button><button class="danger" id="u_block">Block</button><button id="u_auto">Back to automatic</button><small id="u_msg"></small></div>
 <div class="row"><label>Allow many (ids separated by spaces / commas / new lines)<textarea id="u_bulk" rows="2" style="min-width:320px"></textarea></label><button class="ok" id="u_bulkgo">Allow all listed</button></div></div>
+<div class="card"><b>Give an account Stars / a gift</b> <small>For testing and support. Every grant is logged. The gift is added to their inventory as a normal prize (ready to claim).</small>
+<div class="row"><label>Telegram user id<input id="g_id" placeholder="123456789" style="min-width:180px"></label><label>Stars<input id="g_stars" type="number" min="0" value="0" style="width:100px"></label><label>Coins<input id="g_coins" type="number" min="0" value="0" style="width:100px"></label>
+<label>Gift<select id="g_gift"><option value="">— none —</option></select></label><button class="ok" id="g_go">Give</button><small id="g_msg"></small></div></div>
 <table><thead><tr><th>Code</th><th>Status</th><th>Rewards</th><th>Uses</th><th>Window</th><th></th></tr></thead><tbody id="rows"></tbody></table>
 <script>
 const $=id=>document.getElementById(id);let K=sessionStorage.getItem('k')||'';$('key').value=K;
@@ -667,7 +726,7 @@ const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'Content-Type'
 const say=(t,bad)=>{$('msg').textContent=t;$('msg').style.color=bad?'#ff9db5':'#7dffb0'};
 const fmt=d=>d?new Date(d).toLocaleString():'—';
 async function load(){K=$('key').value.trim();sessionStorage.setItem('k',K);try{const j=await api('GET','/admin/promos');
- if($('f_gift').options.length<2)j.valid_gifts.forEach(g=>$('f_gift').add(new Option(g,g)));
+ if($('f_gift').options.length<2)j.valid_gifts.forEach(g=>{$('f_gift').add(new Option(g,g));$('g_gift').add(new Option(g,g))});
  $('rows').innerHTML=j.promos.map(p=>{const rw=[p.coins>0?p.coins+' coins':'',p.stars>0?p.stars+' ⭐':'',...(p.gifts||[])].filter(Boolean).join(', ');
  return '<tr><td><b>'+p.code+'</b><br><small>'+(p.note||'')+'</small></td><td><span class="tag '+p.status+'">'+p.status.replace('_',' ')+'</span></td><td>'+rw+'</td><td>'+p.uses+(p.max_uses!=null?' / '+p.max_uses:'')+'</td><td><small>'+fmt(p.starts_at)+' →<br>'+fmt(p.expires_at)+'</small></td><td class="acts">'
  +(p.active?'<button data-a="off" data-c="'+p.code+'">Disable</button>':'<button class="ok" data-a="on" data-c="'+p.code+'">Enable</button>')
@@ -689,6 +748,8 @@ const accTxt=a=>(a.allowed?'CAN redeem':'cannot redeem')+' ('+a.reason.replace('
 $('u_check').onclick=async()=>{K=$('key').value.trim();try{const j=await api('GET','/admin/users/'+uid());umsg(j.user?accTxt(j.promo_access):'user not found',!j.user)}catch(e){umsg(e.message,1)}};
 for(const [id,v] of [['u_allow',true],['u_block',false],['u_auto',null]])$(id).onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+uid()+'/promo-access',{allowed:v});umsg(accTxt(j.access))}catch(e){umsg(e.message,1)}};
 $('u_bulkgo').onclick=async()=>{K=$('key').value.trim();try{const ids=$('u_bulk').value.split(/[\\s,;]+/).filter(Boolean);const j=await api('POST','/admin/promo-access/bulk',{user_ids:ids,allowed:true});umsg('Allowed '+j.updated+' accounts')}catch(e){umsg(e.message,1)}};
+const gmsg=(t,bad)=>{$('g_msg').textContent=t;$('g_msg').style.color=bad?'#ff9db5':'#7dffb0'};
+$('g_go').onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+$('g_id').value.trim()+'/grant',{stars:+$('g_stars').value,coins:+$('g_coins').value,gift:$('g_gift').value});gmsg('Done. Balance now '+j.stars+' ⭐, '+j.coins+' coins'+(j.prize_id?'. Prize '+j.prize_id:''))}catch(e){gmsg(e.message,1)}};
 if(K)load();
 </script></body></html>`;
 
@@ -696,9 +757,11 @@ if(K)load();
 (async () => {
   try {
     await initDatabase();
+    await notifier.init();
     app.listen(PORT, () => {
       console.log(`🎮 Game server on :${PORT}  (subscription gate ${ENFORCE_SUB ? 'ON' : 'off'}, stars via bot ${BOT_URL ? 'ON' : 'off'}, TON ${TON_API_URL ? 'ON' : 'off'})`);
       if (!ADMIN_API_KEY) console.warn('⚠️  ADMIN_API_KEY not set — /admin routes are disabled');
+      notifier.start();
     });
   } catch (e) {
     console.error('❌ startup failed:', e);
