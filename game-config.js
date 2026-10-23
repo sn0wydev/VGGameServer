@@ -9,6 +9,7 @@
 //   - every wheel's "prizes" chances must add up to EXACTLY 100
 //   - every "preview" table must use the same prize ids as "prizes" and also total 100
 //   - every gift must have an entry in coinValues (what "Convert to coins" pays)
+//   - every NFT gift (nftGifts) must ALSO have an entry in starValues; NFT gifts convert into Stars, all others into coins
 //  "prizes"  = the REAL odds, used only on the server.
 //  "preview" = display-only odds the app uses to paint the reel (what players see scroll by).
 // ============================================================================
@@ -55,8 +56,41 @@ module.exports = {
       "Lucky Locket": 2200
   },
 
+  // STARS paid by "Convert to Stars" - NFT gifts only. Every gift listed in nftGifts MUST have an entry here.
+  // Everyday (non-NFT) gifts keep converting into COINS (coinValues above). These start at the same numbers as the
+  // old coin values; change them freely. Expected return check (after the NFT rebalance): void ~67%, furry ~61%, starry ~67%, astral ~58% of the
+  // price comes back in Stars on average (direct Stars prizes + NFTs valued at starValues). The house always keeps the rest.
+  starValues: {
+      "Calendar": 1000,
+      "Star Notepad": 1250,
+      "Instant Ramen": 1100,
+      "Socks": 900,
+      "Lollipop": 800,
+      "Input Key": 1200,
+      "Astral Shard": 2500,
+      "Kissed Frog": 3600,
+      "Voodoo Doll": 3300,
+      "Vintage Cigar": 3400,
+      "Witch Hat": 1200,
+      "Light Sword": 1150,
+      "Lucky Locket": 2200
+  },
+
   // Gifts that are NFTs (the app marks them as rare/NFT in results).
   nftGifts: ["Calendar","Star Notepad","Instant Ramen","Socks","Lollipop","Input Key","Astral Shard","Kissed Frog","Voodoo Doll","Vintage Cigar","Witch Hat","Light Sword","Lucky Locket"],
+
+  // Rocket crash game (see rocket.js). Remove this block to use defaults; env ROCKET=off disables it.
+  rocket: {
+    minBet: 50,
+    maxBet: 20000,
+    growth: 0.11,          // m(t) = e^(0.11 t)
+    edge: 0.97,            // 3% house edge
+    maxMultiplier: 500,
+    betSeconds: 8,
+    crashPauseSeconds: 4,
+    maxUpgradeValue: 4000, // NFT stakes only upgrade into NFTs worth up to this many Stars
+    nftTiers: null,        // null = all NFTs in nftGifts; or list the ones you actually hold
+  },
 
   wheels: {
     // ── Daily Gift (free, once per cooldown) ──
@@ -107,18 +141,18 @@ module.exports = {
     void: {
       price: 50,
       prizes: [
-      { id: 'voidStars5', type: 'stars', value: 5, chance: 38.7262 },
-      { id: 'voidStars10', type: 'stars', value: 10, chance: 23.2223 },
-      { id: 'voidStars25', type: 'stars', value: 25, chance: 11.8115 },
-      { id: 'voidStars50', type: 'stars', value: 50, chance: 7.0828 },
-      { id: 'voidStars100', type: 'stars', value: 100, chance: 4.2472 },
+      { id: 'voidStars5', type: 'stars', value: 5, chance: 38.1391 },
+      { id: 'voidStars10', type: 'stars', value: 10, chance: 22.8702 },
+      { id: 'voidStars25', type: 'stars', value: 25, chance: 11.6324 },
+      { id: 'voidStars50', type: 'stars', value: 50, chance: 6.9754 },
+      { id: 'voidStars100', type: 'stars', value: 100, chance: 4.1828 },
       { id: 'voidGiftHeart', type: 'gift', value: 'Heart', chance: 8.0000 },
       { id: 'voidGiftBear', type: 'gift', value: 'Bear', chance: 3.0000 },
       { id: 'voidGiftCake', type: 'gift', value: 'Cake', chance: 1.5000 },
       { id: 'voidGiftRocket', type: 'gift', value: 'Rocket', chance: 1.5000 },
-      { id: 'voidGiftLollipop', type: 'gift', value: 'Lollipop', chance: 0.5000 },
-      { id: 'voidGiftSocks', type: 'gift', value: 'Socks', chance: 0.3500 },
-      { id: 'voidGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.0600 }
+      { id: 'voidGiftLollipop', type: 'gift', value: 'Lollipop', chance: 1.2088 },
+      { id: 'voidGiftSocks', type: 'gift', value: 'Socks', chance: 0.8462 },
+      { id: 'voidGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.1451 }
       ],
       preview: [
       { id: 'voidStars5', type: 'stars', value: 5, chance: 20.8200 },
@@ -139,21 +173,21 @@ module.exports = {
     furry: {
       price: 150,
       prizes: [
-      { id: 'furryStars10', type: 'stars', value: 10, chance: 28.5292 },
-      { id: 'furryStars25', type: 'stars', value: 25, chance: 17.3995 },
-      { id: 'furryStars50', type: 'stars', value: 50, chance: 11.9696 },
-      { id: 'furryStars100', type: 'stars', value: 100, chance: 8.2343 },
-      { id: 'furryStars150', type: 'stars', value: 150, chance: 6.6160 },
-      { id: 'furryStars300', type: 'stars', value: 300, chance: 4.5514 },
+      { id: 'furryStars10', type: 'stars', value: 10, chance: 27.8649 },
+      { id: 'furryStars25', type: 'stars', value: 25, chance: 16.9943 },
+      { id: 'furryStars50', type: 'stars', value: 50, chance: 11.6909 },
+      { id: 'furryStars100', type: 'stars', value: 100, chance: 8.0426 },
+      { id: 'furryStars150', type: 'stars', value: 150, chance: 6.4619 },
+      { id: 'furryStars300', type: 'stars', value: 300, chance: 4.4454 },
       { id: 'furryGiftRose', type: 'gift', value: 'Rose', chance: 6.0000 },
       { id: 'furryGiftCake', type: 'gift', value: 'Cake', chance: 5.0000 },
       { id: 'furryGiftChampagne', type: 'gift', value: 'Champagne', chance: 4.0000 },
       { id: 'furryGiftTrophy', type: 'gift', value: 'Trophy', chance: 2.5000 },
       { id: 'furryGiftDiamond', type: 'gift', value: 'Diamond', chance: 2.5000 },
-      { id: 'furryGiftSocks', type: 'gift', value: 'Socks', chance: 0.9000 },
-      { id: 'furryGiftStarNotepad', type: 'gift', value: 'Star Notepad', chance: 0.8000 },
-      { id: 'furryGiftCalendar', type: 'gift', value: 'Calendar', chance: 0.7000 },
-      { id: 'furryGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.3000 }
+      { id: 'furryGiftSocks', type: 'gift', value: 'Socks', chance: 1.5000 },
+      { id: 'furryGiftStarNotepad', type: 'gift', value: 'Star Notepad', chance: 1.3333 },
+      { id: 'furryGiftCalendar', type: 'gift', value: 'Calendar', chance: 1.1667 },
+      { id: 'furryGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.5000 }
       ],
       preview: [
       { id: 'furryStars10', type: 'stars', value: 10, chance: 14.7767 },
@@ -177,21 +211,21 @@ module.exports = {
     hex: {
       price: 500,
       prizes: [
-      { id: 'hexStars25', type: 'stars', value: 25, chance: 23.8378 },
-      { id: 'hexStars50', type: 'stars', value: 50, chance: 18.2903 },
-      { id: 'hexStars100', type: 'stars', value: 100, chance: 14.0338 },
-      { id: 'hexStars250', type: 'stars', value: 250, chance: 9.8876 },
-      { id: 'hexStars500', type: 'stars', value: 500, chance: 7.5865 },
-      { id: 'hexStars1000', type: 'stars', value: 1000, chance: 5.8210 },
+      { id: 'hexStars25', type: 'stars', value: 25, chance: 21.9005 },
+      { id: 'hexStars50', type: 'stars', value: 50, chance: 16.8040 },
+      { id: 'hexStars100', type: 'stars', value: 100, chance: 12.8934 },
+      { id: 'hexStars250', type: 'stars', value: 250, chance: 9.0841 },
+      { id: 'hexStars500', type: 'stars', value: 500, chance: 6.9700 },
+      { id: 'hexStars1000', type: 'stars', value: 1000, chance: 5.3480 },
       { id: 'hexGiftChampagne', type: 'gift', value: 'Champagne', chance: 4.0000 },
       { id: 'hexGiftTrophy', type: 'gift', value: 'Trophy', chance: 4.0000 },
       { id: 'hexGiftDiamond', type: 'gift', value: 'Diamond', chance: 4.0000 },
       { id: 'hexGiftRing', type: 'gift', value: 'Ring', chance: 3.0000 },
-      { id: 'hexGiftLightSword', type: 'gift', value: 'Light Sword', chance: 2.2340 },
-      { id: 'hexGiftWitchHat', type: 'gift', value: 'Witch Hat', chance: 2.1920 },
-      { id: 'hexGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 0.3890 },
-      { id: 'hexGiftVintageCigar', type: 'gift', value: 'Vintage Cigar', chance: 0.3770 },
-      { id: 'hexGiftKissedFrog', type: 'gift', value: 'Kissed Frog', chance: 0.3510 }
+      { id: 'hexGiftLightSword', type: 'gift', value: 'Light Sword', chance: 4.8364 },
+      { id: 'hexGiftWitchHat', type: 'gift', value: 'Witch Hat', chance: 4.7454 },
+      { id: 'hexGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 0.8421 },
+      { id: 'hexGiftVintageCigar', type: 'gift', value: 'Vintage Cigar', chance: 0.8162 },
+      { id: 'hexGiftKissedFrog', type: 'gift', value: 'Kissed Frog', chance: 0.7599 }
       ],
       preview: [
       { id: 'hexStars25', type: 'stars', value: 25, chance: 13.5851 },
@@ -215,19 +249,19 @@ module.exports = {
     astral: {
       price: 1000,
       prizes: [
-      { id: 'astralStars50', type: 'stars', value: 50, chance: 25.7190 },
-      { id: 'astralStars100', type: 'stars', value: 100, chance: 19.0528 },
-      { id: 'astralStars250', type: 'stars', value: 250, chance: 12.8149 },
-      { id: 'astralStars500', type: 'stars', value: 500, chance: 9.4934 },
-      { id: 'astralStars1000', type: 'stars', value: 1000, chance: 7.0327 },
-      { id: 'astralStars2500', type: 'stars', value: 2500, chance: 4.7302 },
+      { id: 'astralStars50', type: 'stars', value: 50, chance: 22.8345 },
+      { id: 'astralStars100', type: 'stars', value: 100, chance: 16.9158 },
+      { id: 'astralStars250', type: 'stars', value: 250, chance: 11.3776 },
+      { id: 'astralStars500', type: 'stars', value: 500, chance: 8.4287 },
+      { id: 'astralStars1000', type: 'stars', value: 1000, chance: 6.2439 },
+      { id: 'astralStars2500', type: 'stars', value: 2500, chance: 4.1996 },
       { id: 'astralGiftDiamond', type: 'gift', value: 'Diamond', chance: 5.0000 },
       { id: 'astralGiftTrophy', type: 'gift', value: 'Trophy', chance: 4.0000 },
       { id: 'astralGiftRing', type: 'gift', value: 'Ring', chance: 4.0000 },
-      { id: 'astralGiftInputKey', type: 'gift', value: 'Input Key', chance: 4.3780 },
-      { id: 'astralGiftLuckyLocket', type: 'gift', value: 'Lucky Locket', chance: 2.1450 },
-      { id: 'astralGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 1.1970 },
-      { id: 'astralGiftAstralShard', type: 'gift', value: 'Astral Shard', chance: 0.4370 }
+      { id: 'astralGiftInputKey', type: 'gift', value: 'Input Key', chance: 9.1242 },
+      { id: 'astralGiftLuckyLocket', type: 'gift', value: 'Lucky Locket', chance: 4.4704 },
+      { id: 'astralGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 2.4946 },
+      { id: 'astralGiftAstralShard', type: 'gift', value: 'Astral Shard', chance: 0.9107 }
       ],
       preview: [
       { id: 'astralStars50', type: 'stars', value: 50, chance: 14.7034 },
