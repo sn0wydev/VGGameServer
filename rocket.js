@@ -102,7 +102,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
       betEndsAt: r ? r.betEndsAt : 0, flyStartedAt: r ? r.flyStartedAt : 0,
       crashAt: crashed ? r.crashAt : null, secret: crashed ? r.secret : null,
       history,
-      bets: r ? [...r.bets.values()].map((b) => ({ n: b.name, k: b.kind, a: b.amount || null, i: b.item || null, s: b.status, x: b.cashAt || null })) : [],
+      bets: r ? [...r.bets.values()].map((b) => ({ n: b.name, k: b.kind, a: b.amount || null, i: b.item || null, s: b.status === 'cashing' ? 'active' : b.status, x: b.cashAt || null, me: b.userId === userId })) : [],
       me: r && userId ? myBetView(r.bets.get(userId)) : null,
     };
   }
