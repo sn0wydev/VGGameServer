@@ -375,6 +375,36 @@ async function claimExternalCredits(tgUser, initData) {
 // ---------------------------------------------------------------------------
 // Public config (what the app needs to DRAW things; real odds are not included)
 // ---------------------------------------------------------------------------
+// What converting an NFT from the inventory pays in Stars.
+//   1. live market price from the relayer's buyback board (env RELAYER_URL, refreshed every 10 min), else
+//   2. nftConvertPrices in game-config.js (placeholder copy of the board), else
+//   3. starValues x nftConvertRate.
+// Always rounded DOWN to a tidy number (339 -> 330, 456 -> 450). starValues itself still drives wheel odds and Rocket.
+const CONVERT_RATE = Number.isFinite(Number(CFG.nftConvertRate)) ? Number(CFG.nftConvertRate) : 0.5;
+const tidy = (n) => { n = Math.floor(n); const step = n >= 100 ? 10 : n >= 20 ? 5 : 1; return Math.max(1, Math.floor(n / step) * step); };
+const convertValues = {};
+let livePrices = {};
+function rebuildConvertValues() {
+  for (const n of CFG.nftGifts || []) {
+    const raw = livePrices[n] || (CFG.nftConvertPrices || {})[n] || ((CFG.starValues || {})[n] > 0 ? CFG.starValues[n] * CONVERT_RATE : 0);
+    if (raw > 0) convertValues[n] = tidy(raw); else delete convertValues[n];
+  }
+}
+rebuildConvertValues();
+const RELAYER_URL_PRICES = (process.env.RELAYER_URL || '').replace(/\/+$/, '');
+async function refreshLivePrices() {
+  if (!RELAYER_URL_PRICES) return;
+  try {
+    const r = await fetch(`${RELAYER_URL_PRICES}/buyback/prices`, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const next = {};
+    for (const i of d.items || []) if (Number(i.stars) > 0) next[i.title] = Number(i.stars);
+    if (Object.keys(next).length) { livePrices = next; rebuildConvertValues(); }
+  } catch (e) { console.warn('⚠️ could not refresh convert prices from the relayer:', e.message, '(keeping the last known prices)'); }
+}
+if (RELAYER_URL_PRICES) { refreshLivePrices(); setInterval(refreshLivePrices, 10 * 60 * 1000).unref(); }
+
 const publicConfig = (() => {
   const wheels = {};
   for (const [name, w] of Object.entries(CFG.wheels)) {
@@ -386,7 +416,7 @@ const publicConfig = (() => {
       giftChance: sum((r) => r.type === 'gift'),
     };
   }
-  return { wheels, multipliers: CFG.multipliers, coinValues: CFG.coinValues, starValues: CFG.starValues || {}, nftGifts: CFG.nftGifts, dailyCooldownMs: DAILY_MS };
+  return { wheels, multipliers: CFG.multipliers, coinValues: CFG.coinValues, starValues: CFG.starValues || {}, convertValues, nftGifts: CFG.nftGifts, dailyCooldownMs: DAILY_MS };
 })();
 
 app.get('/', (req, res) => res.json({ status: 'online', service: 'VoidGifts game server', wheels: Object.keys(CFG.wheels) }));
@@ -506,7 +536,7 @@ app.post('/api/prizes/:id/convert', auth, limit('convert', 30, 10000), wrap(asyn
     if (!p.rowCount) throw fail(409, 'NOT_CONVERTIBLE', 'This prize can no longer be converted');
     const gift = p.rows[0].gift_name;
     // NFT gifts convert into STARS, everyday gifts into COINS.
-    const starValue = (CFG.nftGifts || []).includes(gift) ? (CFG.starValues || {})[gift] : 0;
+    const starValue = convertValues[gift] || 0;
     if (starValue > 0) {
       const upd = await c.query('UPDATE users SET stars = stars + $2, updated_at = NOW() WHERE user_id = $1 RETURNING *', [req.user.id, starValue]);
       await addLedger(c, req.user.id, 'convert', starValue, 0, { gift, prize_id: req.params.id, into: 'stars' });
