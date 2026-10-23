@@ -63,6 +63,7 @@ function validateConfig() {
       if (!(r.chance > 0)) errs.push(`${name}: ${r.id} chance must be > 0`);
       if (!['coin', 'stars', 'gift'].includes(r.type)) errs.push(`${name}: ${r.id} bad type ${r.type}`);
       if (r.type === 'gift' && !(r.value in CFG.coinValues)) errs.push(`${name}: gift "${r.value}" has no coinValues entry`);
+      if (r.type === 'gift' && (CFG.nftGifts || []).includes(r.value) && !((CFG.starValues || {})[r.value] > 0)) errs.push(`${name}: NFT gift "${r.value}" has no starValues entry`);
       if (r.type !== 'gift' && !(Number(r.value) > 0)) errs.push(`${name}: ${r.id} value must be > 0`);
     }
     if (!(w.price >= 0)) errs.push(`${name}: bad price`);
@@ -82,6 +83,9 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process
 const GIFT_NAMES = new Set(Object.keys(CFG.coinValues));
 const NFT_SET = new Set(CFG.nftGifts);
 const DAILY_MS = Math.round((CFG.dailyCooldownHours || 24) * 3600 * 1000);
+
+// Scheduled bot messages (daily gift ready / comeback nudges) - see notifications.js
+const notifier = require('./notifications').createNotifier({ pool, botToken: BOT_TOKEN, dailyMs: DAILY_MS });
 
 // ---------------------------------------------------------------------------
 // Telegram initData verification (same algorithm the bot and relayer use)
@@ -134,6 +138,7 @@ function auth(req, res, next) {
   const user = verifyInitData(req.get('x-telegram-init-data'));
   if (!user) return res.status(401).json({ error: 'Invalid or expired Telegram session', code: 'UNAUTHORIZED' });
   req.user = user;
+  notifier.touch(user);
   next();
 }
 const wrap = (fn) => (req, res) => fn(req, res).catch((err) => {
@@ -246,6 +251,13 @@ function promoAccess(u) {
 // ---------------------------------------------------------------------------
 // Rolling & prize creation
 // ---------------------------------------------------------------------------
+// DEMO mode (dev only): env DEMO_MODE=on lets a client ask for a guaranteed random NFT on wheel spins.
+// With the env var unset (main / production) the flag is ignored and not even advertised.
+const DEMO_MODE = process.env.DEMO_MODE === 'on';
+function rollDemo(prizes) {
+  const nfts = prizes.filter((p) => p.type === 'gift' && NFT_SET.has(p.value));
+  return nfts.length ? nfts[crypto.randomInt(0, nfts.length)] : rollOne(prizes);
+}
 function rollOne(prizes) {
   const r = crypto.randomInt(0, 1_000_000_000) / 1e7;       // uniform in [0, 100)
   let cum = 0;
@@ -327,7 +339,7 @@ async function claimExternalCredits(tgUser, initData) {
   }
   if (TON_API_URL) {
     try {
-      const r = await fetch(`${TON_API_URL}/ton/claim-credits/${tgUser.id}`, { signal: AbortSignal.timeout(6000) });
+      const r = await fetch(`${TON_API_URL}/ton/claim-credits/${tgUser.id}`, { headers: { 'x-internal-key': process.env.INTERNAL_API_KEY || '' }, signal: AbortSignal.timeout(6000) });
       if (r.ok) {
         const d = await r.json();
         if (d.stars > 0) entries.push({ stars: Math.trunc(d.stars), ref: `ton:${tgUser.id}:${Date.now()}` });
@@ -374,7 +386,7 @@ const publicConfig = (() => {
       giftChance: sum((r) => r.type === 'gift'),
     };
   }
-  return { wheels, multipliers: CFG.multipliers, coinValues: CFG.coinValues, nftGifts: CFG.nftGifts, dailyCooldownMs: DAILY_MS };
+  return { wheels, multipliers: CFG.multipliers, coinValues: CFG.coinValues, starValues: CFG.starValues || {}, nftGifts: CFG.nftGifts, dailyCooldownMs: DAILY_MS };
 })();
 
 app.get('/', (req, res) => res.json({ status: 'online', service: 'VoidGifts game server', wheels: Object.keys(CFG.wheels) }));
@@ -387,12 +399,13 @@ async function loadState(userId) {
   const u = (await pool.query('SELECT * FROM users WHERE user_id = $1', [userId])).rows[0];
   const inv = (await pool.query(
     `SELECT prize_id, gift_name, status, created_at, scheduled_for FROM prizes
-      WHERE user_id = $1 AND status NOT IN ('claimed','converted') ORDER BY created_at DESC LIMIT 500`, [userId])).rows;
+      WHERE user_id = $1 AND status NOT IN ('claimed','converted','staked','rocket_done') ORDER BY created_at DESC LIMIT 500`, [userId])).rows;
   const last = u && u.daily_last_at ? new Date(u.daily_last_at).getTime() : 0;
   const remaining = Math.max(0, last + DAILY_MS - Date.now());
   return {
     balance: u ? bal(u) : { stars: 0, coins: 0, stars_spent: 0 },
     show_in_leaderboard: u ? u.show_in_leaderboard : true,
+    notify_enabled: u ? u.notify_enabled !== false : true,
     promo: promoAccess(u || {}),
     daily: { ready: remaining === 0, remaining_ms: remaining, last_at: last || null },
     inventory: inv.map((r) => ({
@@ -421,9 +434,11 @@ app.post('/api/credits/claim', auth, limit('credits', 20, 10000), wrap(async (re
 
 app.post('/api/profile', auth, limit('profile', 10, 10000), wrap(async (req, res) => {
   const show = req.body && typeof req.body.show_in_leaderboard === 'boolean' ? req.body.show_in_leaderboard : null;
+  const notify = req.body && typeof req.body.notify_enabled === 'boolean' ? req.body.notify_enabled : null;
   await tx(async (c) => {
     await lockUser(c, req.user);
     if (show !== null) await c.query('UPDATE users SET show_in_leaderboard = $2 WHERE user_id = $1', [req.user.id, show]);
+    if (notify !== null) await c.query('UPDATE users SET notify_enabled = $2 WHERE user_id = $1', [req.user.id, notify]);
   });
   res.json({ ok: true });
 }));
@@ -446,7 +461,8 @@ app.post('/api/spin', auth, limit('spin', 12, 10000), wrap(async (req, res) => {
     const afterSpend = Number(u.stars) - total;
 
     const list = [];
-    for (let i = 0; i < mult; i++) list.push(rollOne(w.prizes));
+    const demo = DEMO_MODE && (req.body || {}).demo === true;
+    for (let i = 0; i < mult; i++) list.push(demo ? rollDemo(w.prizes) : rollOne(w.prizes));
     const g = await grantPrizes(c, req.user, list);
 
     const upd = await c.query(
@@ -467,7 +483,7 @@ app.post('/api/daily', auth, limit('daily', 6, 10000), wrap(async (req, res) => 
     const last = u.daily_last_at ? new Date(u.daily_last_at).getTime() : 0;
     const remaining = last + DAILY_MS - Date.now();
     if (remaining > 0) throw fail(429, 'DAILY_COOLDOWN', 'Daily gift is on cooldown', { remaining_ms: remaining });
-    const g = await grantPrizes(c, req.user, [rollOne(w.prizes)]);
+    const g = await grantPrizes(c, req.user, [DEMO_MODE && (req.body || {}).demo === true ? rollDemo(w.prizes) : rollOne(w.prizes)]);
     const upd = await c.query(
       `UPDATE users SET daily_last_at = NOW(), stars = stars + $2, coins = coins + $3, updated_at = NOW() WHERE user_id = $1 RETURNING *`,
       [req.user.id, g.stars, g.coins]);
@@ -488,11 +504,19 @@ app.post('/api/prizes/:id/convert', auth, limit('convert', 30, 10000), wrap(asyn
       `UPDATE prizes SET status = 'converted', updated_at = NOW()
         WHERE prize_id = $1 AND user_id = $2 AND status = 'pending' RETURNING gift_name`, [req.params.id, req.user.id]);
     if (!p.rowCount) throw fail(409, 'NOT_CONVERTIBLE', 'This prize can no longer be converted');
-    const value = CFG.coinValues[p.rows[0].gift_name];
-    if (!value) throw new Error(`no coin value for ${p.rows[0].gift_name}`);
+    const gift = p.rows[0].gift_name;
+    // NFT gifts convert into STARS, everyday gifts into COINS.
+    const starValue = (CFG.nftGifts || []).includes(gift) ? (CFG.starValues || {})[gift] : 0;
+    if (starValue > 0) {
+      const upd = await c.query('UPDATE users SET stars = stars + $2, updated_at = NOW() WHERE user_id = $1 RETURNING *', [req.user.id, starValue]);
+      await addLedger(c, req.user.id, 'convert', starValue, 0, { gift, prize_id: req.params.id, into: 'stars' });
+      return { stars: starValue, coins: 0, currency: 'stars', balance: bal(upd.rows[0]) };
+    }
+    const value = CFG.coinValues[gift];
+    if (!value) throw new Error(`no coin value for ${gift}`);
     const upd = await c.query('UPDATE users SET coins = coins + $2, updated_at = NOW() WHERE user_id = $1 RETURNING *', [req.user.id, value]);
-    await addLedger(c, req.user.id, 'convert', 0, value, { gift: p.rows[0].gift_name, prize_id: req.params.id });
-    return { coins: value, balance: bal(upd.rows[0]) };
+    await addLedger(c, req.user.id, 'convert', 0, value, { gift, prize_id: req.params.id, into: 'coins' });
+    return { stars: 0, coins: value, currency: 'coins', balance: bal(upd.rows[0]) };
   });
   res.json(out);
 }));
@@ -575,6 +599,27 @@ app.get('/admin/promos', adminAuth, wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM promocodes ORDER BY created_at DESC');
   res.json({ valid_gifts: [...GIFT_NAMES], promos: rows.map((p) => ({ ...p, status: promoStatus(p) })) });
 }));
+// The main bot tells us which language a player picked in /start (en | ru). Used for the scheduled messages.
+// Header x-internal-key = INTERNAL_API_KEY (same secret as the other services). 503 if unset, 401 if wrong.
+app.post('/internal/user-lang', wrap(async (req, res) => {
+  const KEY = process.env.INTERNAL_API_KEY;
+  if (!KEY) throw fail(503, 'NOT_CONFIGURED', 'INTERNAL_API_KEY not set');
+  const given = Buffer.from(String(req.get('x-internal-key') || '')), want = Buffer.from(KEY);
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) throw fail(401, 'UNAUTHORIZED', 'Unauthorized');
+  const id = Number((req.body || {}).user_id), lang = String((req.body || {}).lang || '');
+  if (!Number.isSafeInteger(id) || id <= 0 || !require('./notifications').CHOICES.includes(lang)) throw fail(400, 'BAD_REQUEST', 'user_id and lang (en|ru) required');
+  await pool.query('INSERT INTO users (user_id, lang_pref) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET lang_pref = $2', [id, lang]);
+  res.json({ ok: true });
+}));
+
+// Send a test bot message to one player: body { kind: 'daily' | 'nudge' }. Also GET-able counters via /admin/notify/run.
+app.post('/admin/users/:id/notify-test', adminAuth, wrap(async (req, res) => {
+  const r = await notifier.sendTest(req.params.id, (req.body || {}).kind);
+  res.status(r.ok ? 200 : 502).json(r);
+}));
+// Run the scheduler once right now (handy after changing a user's daily_last_at in the database).
+app.post('/admin/notify/run', adminAuth, wrap(async (req, res) => { res.json(await notifier.tick()); }));
+
 app.post('/admin/promos', adminAuth, wrap(async (req, res) => {
   const p = parsePromoBody(req.body || {});
   const r = await pool.query(
@@ -726,12 +771,23 @@ if(K)load();
 </script></body></html>`;
 
 // ---------------------------------------------------------------------------
+const rocket = require('./rocket').createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail, requireSubscription });
+rocket.routes(app, { auth, limit, wrap });
+publicConfig.rocket = rocket.publicConfig();
+if (DEMO_MODE) { publicConfig.demoMode = true; console.warn('🧪 DEMO_MODE is ON — clients can force NFT wins. Never enable this in production.'); }
+
 (async () => {
   try {
     await initDatabase();
+    await rocket.init();
+    await notifier.init();
     app.listen(PORT, () => {
+      if (!BOT_URL) console.error('🚨 BOT_URL is not set — Telegram Stars purchases will NOT be delivered to players. Set BOT_URL to the main bot (VGServers) URL.');
+      if (!TON_API_URL) console.error('⚠️ TON_API_URL is not set — TON deposits will NOT be delivered.');
       console.log(`🎮 Game server on :${PORT}  (subscription gate ${ENFORCE_SUB ? 'ON' : 'off'}, stars via bot ${BOT_URL ? 'ON' : 'off'}, TON ${TON_API_URL ? 'ON' : 'off'})`);
       if (!ADMIN_API_KEY) console.warn('⚠️  ADMIN_API_KEY not set — /admin routes are disabled');
+      notifier.start();
+      rocket.start();
     });
   } catch (e) {
     console.error('❌ startup failed:', e);
