@@ -60,6 +60,14 @@ module.exports = {
   // Everyday (non-NFT) gifts keep converting into COINS (coinValues above). These start at the same numbers as the
   // old coin values; change them freely. Expected return check (after the NFT rebalance): void ~67%, furry ~61%, starry ~67%, astral ~58% of the
   // price comes back in Stars on average (direct Stars prizes + NFTs valued at starValues). The house always keeps the rest.
+  // Inventory "convert NFT to Stars". Prices follow the relayer's sell-gift board (set env RELAYER_URL on the game server for live market prices);
+  // these are the placeholder copies used until then. Everything is rounded down to a tidy number (339 -> 330).
+  // An NFT missing here pays starValues x nftConvertRate. Wheels and Rocket still use the full starValues.
+  nftConvertRate: 0.5,
+  nftConvertPrices: {
+    "Star Notepad": 468, "Instant Ramen": 381, "Input Key": 645, "Astral Shard": 11713, "Kissed Frog": 3958,
+    "Voodoo Doll": 3770, "Vintage Cigar": 3773, "Witch Hat": 671, "Light Sword": 663, "Lucky Locket": 1935,
+  },
   starValues: {
       "Calendar": 1000,
       "Star Notepad": 1250,
