@@ -429,7 +429,7 @@ async function loadState(userId) {
   const u = (await pool.query('SELECT * FROM users WHERE user_id = $1', [userId])).rows[0];
   const inv = (await pool.query(
     `SELECT prize_id, gift_name, status, created_at, scheduled_for FROM prizes
-      WHERE user_id = $1 AND status NOT IN ('claimed','converted','staked','rocket_done') ORDER BY created_at DESC LIMIT 500`, [userId])).rows;
+      WHERE user_id = $1 AND status NOT IN ('claimed','converted','staked','rocket_done','battle_done') ORDER BY created_at DESC LIMIT 500`, [userId])).rows;
   const last = u && u.daily_last_at ? new Date(u.daily_last_at).getTime() : 0;
   const remaining = Math.max(0, last + DAILY_MS - Date.now());
   return {
@@ -803,13 +803,19 @@ if(K)load();
 // ---------------------------------------------------------------------------
 const rocket = require('./rocket').createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail, requireSubscription });
 rocket.routes(app, { auth, limit, wrap });
+// Deployed commit (Railway sets RAILWAY_GIT_COMMIT_SHA for GitHub deploys); shown in the app's version tag.
+publicConfig.version = { commit: String(process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || '').slice(0, 7) || null };
 publicConfig.rocket = rocket.publicConfig();
+const battle = require('./battle').createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, requireSubscription });
+battle.routes(app, { auth, limit, wrap });
+publicConfig.battle = battle.publicConfig();
 if (DEMO_MODE) { publicConfig.demoMode = true; console.warn('🧪 DEMO_MODE is ON — clients can force NFT wins. Never enable this in production.'); }
 
 (async () => {
   try {
     await initDatabase();
     await rocket.init();
+    await battle.init();
     await notifier.init();
     app.listen(PORT, () => {
       if (!BOT_URL) console.error('🚨 BOT_URL is not set — Telegram Stars purchases will NOT be delivered to players. Set BOT_URL to the main bot (VGServers) URL.');
@@ -818,6 +824,7 @@ if (DEMO_MODE) { publicConfig.demoMode = true; console.warn('🧪 DEMO_MODE is O
       if (!ADMIN_API_KEY) console.warn('⚠️  ADMIN_API_KEY not set — /admin routes are disabled');
       notifier.start();
       rocket.start();
+      battle.start();
     });
   } catch (e) {
     console.error('❌ startup failed:', e);
