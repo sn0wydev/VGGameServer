@@ -100,6 +100,16 @@ module.exports = {
     nftTiers: null,        // null = all NFTs in nftGifts; or list the ones you actually hold
   },
 
+  // Gift Battle (see battle.js). Remove this block to use defaults; env BATTLE=off disables it.
+  battle: {
+    betSeconds: 30,        // countdown that starts when the first gift is placed
+    spinSeconds: 8,
+    resultSeconds: 7,
+    maxPlayers: 25,
+    maxItemsPerPlayer: 5,
+    minItemValue: 1,
+  },
+
   wheels: {
     // ── Daily Gift (free, once per cooldown) ──
     daily: {
