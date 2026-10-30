@@ -9,6 +9,7 @@
 //   - every wheel's "prizes" chances must add up to EXACTLY 100
 //   - every "preview" table must use the same prize ids as "prizes" and also total 100
 //   - every gift must have an entry in coinValues (what "Convert to coins" pays)
+//   - every NFT gift (nftGifts) must ALSO have an entry in starValues; NFT gifts convert into Stars, all others into coins
 //  "prizes"  = the REAL odds, used only on the server.
 //  "preview" = display-only odds the app uses to paint the reel (what players see scroll by).
 // ============================================================================
@@ -55,8 +56,65 @@ module.exports = {
       "Lucky Locket": 2200
   },
 
+  // STARS paid by "Convert to Stars" - NFT gifts only. Every gift listed in nftGifts MUST have an entry here.
+  // Everyday (non-NFT) gifts keep converting into COINS (coinValues above). These start at the same numbers as the
+  // old coin values; change them freely. Expected return check (after the NFT rebalance): void ~67%, furry ~61%, starry ~67%, astral ~58% of the
+  // price comes back in Stars on average (direct Stars prizes + NFTs valued at starValues). The house always keeps the rest.
+  // Inventory "convert NFT to Stars". Prices follow the relayer's sell-gift board (set env RELAYER_URL on the game server for live market prices);
+  // these are the placeholder copies used until then. Everything is rounded down to a tidy number (339 -> 330).
+  // An NFT missing here pays starValues x nftConvertRate. Wheels and Rocket still use the full starValues.
+  nftConvertRate: 0.5,
+  nftConvertPrices: {
+    "Star Notepad": 468, "Instant Ramen": 381, "Input Key": 645, "Astral Shard": 11713, "Kissed Frog": 3958,
+    "Voodoo Doll": 3770, "Vintage Cigar": 3773, "Witch Hat": 671, "Light Sword": 663, "Lucky Locket": 1935,
+  },
+  starValues: {
+      "Calendar": 1000,
+      "Star Notepad": 1250,
+      "Instant Ramen": 1100,
+      "Socks": 900,
+      "Lollipop": 800,
+      "Input Key": 1200,
+      "Astral Shard": 2500,
+      "Kissed Frog": 3600,
+      "Voodoo Doll": 3300,
+      "Vintage Cigar": 3400,
+      "Witch Hat": 1200,
+      "Light Sword": 1150,
+      "Lucky Locket": 2200
+  },
+
   // Gifts that are NFTs (the app marks them as rare/NFT in results).
   nftGifts: ["Calendar","Star Notepad","Instant Ramen","Socks","Lollipop","Input Key","Astral Shard","Kissed Frog","Voodoo Doll","Vintage Cigar","Witch Hat","Light Sword","Lucky Locket"],
+
+  // Rocket crash game (see rocket.js). Remove this block to use defaults; env ROCKET=off disables it.
+  rocket: {
+    minBet: 50,
+    maxBet: 20000,
+    growth: 0.11,          // m(t) = e^(0.11 t)
+    edge: 0.97,            // 3% house edge
+    maxMultiplier: 500,
+    betSeconds: 8,
+    crashPauseSeconds: 4,
+    maxUpgradeValue: 4000, // NFT stakes only upgrade into NFTs worth up to this many Stars
+    nftTiers: null,        // null = all NFTs in nftGifts; or list the ones you actually hold
+  },
+
+  // Gift Battle (see battle.js). Remove this block to use defaults; env BATTLE=off disables it.
+  battle: {
+    betSeconds: 30,        // countdown that starts when the first gift is placed
+    spinSeconds: 8,
+    resultSeconds: 7,
+    maxPlayers: 0,         // 0 = no limit on players per round
+    maxItemsPerPlayer: 5,
+    minItemValue: 1,
+    // House fee, taken in gifts out of the OTHER players' stakes. No fee when the winner held freeAtChance (90%) or more;
+    // below that it grows linearly up to maxPct at ~0% chance:  pct = maxPct x (1 - chance / freeAtChance).
+    fee: { enabled: true, maxPct: 10, freeAtChance: 0.9 },
+    // What everyday (non-NFT) gifts count for INSIDE Gift Battle: their real Telegram Star prices. NFTs use starValues.
+    // A gift missing here falls back to its coin value. Wheels, Rocket and converting are not affected.
+    basicValues: { Heart: 15, Bear: 15, Rose: 25, Gift: 25, Cake: 50, "Rose Bouquet": 50, Champagne: 50, Rocket: 50, Ring: 100, Trophy: 100, Diamond: 100 },
+  },
 
   wheels: {
     // ── Daily Gift (free, once per cooldown) ──
