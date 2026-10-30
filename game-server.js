@@ -63,6 +63,7 @@ function validateConfig() {
       if (!(r.chance > 0)) errs.push(`${name}: ${r.id} chance must be > 0`);
       if (!['coin', 'stars', 'gift'].includes(r.type)) errs.push(`${name}: ${r.id} bad type ${r.type}`);
       if (r.type === 'gift' && !(r.value in CFG.coinValues)) errs.push(`${name}: gift "${r.value}" has no coinValues entry`);
+      if (r.type === 'gift' && (CFG.nftGifts || []).includes(r.value) && !((CFG.starValues || {})[r.value] > 0)) errs.push(`${name}: NFT gift "${r.value}" has no starValues entry`);
       if (r.type !== 'gift' && !(Number(r.value) > 0)) errs.push(`${name}: ${r.id} value must be > 0`);
     }
     if (!(w.price >= 0)) errs.push(`${name}: bad price`);
@@ -250,6 +251,13 @@ function promoAccess(u) {
 // ---------------------------------------------------------------------------
 // Rolling & prize creation
 // ---------------------------------------------------------------------------
+// DEMO mode (dev only): env DEMO_MODE=on lets a client ask for a guaranteed random NFT on wheel spins.
+// With the env var unset (main / production) the flag is ignored and not even advertised.
+const DEMO_MODE = process.env.DEMO_MODE === 'on';
+function rollDemo(prizes) {
+  const nfts = prizes.filter((p) => p.type === 'gift' && NFT_SET.has(p.value));
+  return nfts.length ? nfts[crypto.randomInt(0, nfts.length)] : rollOne(prizes);
+}
 function rollOne(prizes) {
   const r = crypto.randomInt(0, 1_000_000_000) / 1e7;       // uniform in [0, 100)
   let cum = 0;
@@ -367,6 +375,36 @@ async function claimExternalCredits(tgUser, initData) {
 // ---------------------------------------------------------------------------
 // Public config (what the app needs to DRAW things; real odds are not included)
 // ---------------------------------------------------------------------------
+// What converting an NFT from the inventory pays in Stars.
+//   1. live market price from the relayer's buyback board (env RELAYER_URL, refreshed every 10 min), else
+//   2. nftConvertPrices in game-config.js (placeholder copy of the board), else
+//   3. starValues x nftConvertRate.
+// Always rounded DOWN to a tidy number (339 -> 330, 456 -> 450). starValues itself still drives wheel odds and Rocket.
+const CONVERT_RATE = Number.isFinite(Number(CFG.nftConvertRate)) ? Number(CFG.nftConvertRate) : 0.5;
+const tidy = (n) => { n = Math.floor(n); const step = n >= 100 ? 10 : n >= 20 ? 5 : 1; return Math.max(1, Math.floor(n / step) * step); };
+const convertValues = {};
+let livePrices = {};
+function rebuildConvertValues() {
+  for (const n of CFG.nftGifts || []) {
+    const raw = livePrices[n] || (CFG.nftConvertPrices || {})[n] || ((CFG.starValues || {})[n] > 0 ? CFG.starValues[n] * CONVERT_RATE : 0);
+    if (raw > 0) convertValues[n] = tidy(raw); else delete convertValues[n];
+  }
+}
+rebuildConvertValues();
+const RELAYER_URL_PRICES = (process.env.RELAYER_URL || '').replace(/\/+$/, '');
+async function refreshLivePrices() {
+  if (!RELAYER_URL_PRICES) return;
+  try {
+    const r = await fetch(`${RELAYER_URL_PRICES}/buyback/prices`, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const next = {};
+    for (const i of d.items || []) if (Number(i.stars) > 0) next[i.title] = Number(i.stars);
+    if (Object.keys(next).length) { livePrices = next; rebuildConvertValues(); }
+  } catch (e) { console.warn('⚠️ could not refresh convert prices from the relayer:', e.message, '(keeping the last known prices)'); }
+}
+if (RELAYER_URL_PRICES) { refreshLivePrices(); setInterval(refreshLivePrices, 10 * 60 * 1000).unref(); }
+
 const publicConfig = (() => {
   const wheels = {};
   for (const [name, w] of Object.entries(CFG.wheels)) {
@@ -378,11 +416,29 @@ const publicConfig = (() => {
       giftChance: sum((r) => r.type === 'gift'),
     };
   }
-  return { wheels, multipliers: CFG.multipliers, coinValues: CFG.coinValues, nftGifts: CFG.nftGifts, dailyCooldownMs: DAILY_MS };
+  return { wheels, multipliers: CFG.multipliers, coinValues: CFG.coinValues, starValues: CFG.starValues || {}, convertValues, nftGifts: CFG.nftGifts, dailyCooldownMs: DAILY_MS };
 })();
 
 app.get('/', (req, res) => res.json({ status: 'online', service: 'VoidGifts game server', wheels: Object.keys(CFG.wheels) }));
 app.get('/api/config', (req, res) => res.set('Cache-Control', 'public, max-age=60').json(publicConfig));
+
+// Global "Live gifts" strip: the most recent REAL non-NFT gift wins across all players. Only the gift name and time are public
+// (no names, no ids - a prize id is the claim code). Cached for a few seconds so it costs one cheap query per interval.
+const LIVE_FEED_MIN_COINS = 100;   // skip the cheapest gifts (Heart, Bear); NFT gifts are never shown in this strip
+const LIVE_FEED_GIFTS = Object.keys(CFG.coinValues).filter((n) => !NFT_SET.has(n) && CFG.coinValues[n] >= LIVE_FEED_MIN_COINS);
+let liveFeedCache = { at: 0, items: [] };
+app.get('/api/live-gifts', limit('livegifts', 20, 10000), wrap(async (req, res) => {
+  if (Date.now() - liveFeedCache.at > 8000) {
+    // Real WHEEL wins only (the ledger of paid/free spins). Gifts that merely change hands (a Gift Battle winner is handed the pot) never show up here.
+    const { rows } = await pool.query(
+      `SELECT g.gift AS gift_name, l.created_at FROM ledger l, LATERAL jsonb_array_elements_text(l.meta->'gifts') AS g(gift)
+        WHERE l.kind LIKE 'spin:%' AND jsonb_typeof(l.meta->'gifts') = 'array' AND l.created_at > NOW() - INTERVAL '7 days'
+          AND g.gift = ANY($1)
+        ORDER BY l.created_at DESC LIMIT 20`, [LIVE_FEED_GIFTS]);
+    liveFeedCache = { at: Date.now(), items: rows.reverse().map((r) => ({ gift: r.gift_name, ts: new Date(r.created_at).getTime() })) };
+  }
+  res.set('Cache-Control', 'public, max-age=8').json({ items: liveFeedCache.items });
+}));
 
 // ---------------------------------------------------------------------------
 // Player state
@@ -391,7 +447,7 @@ async function loadState(userId) {
   const u = (await pool.query('SELECT * FROM users WHERE user_id = $1', [userId])).rows[0];
   const inv = (await pool.query(
     `SELECT prize_id, gift_name, status, created_at, scheduled_for FROM prizes
-      WHERE user_id = $1 AND status NOT IN ('claimed','converted') ORDER BY created_at DESC LIMIT 500`, [userId])).rows;
+      WHERE user_id = $1 AND status NOT IN ('claimed','converted','staked','rocket_done','battle_done') ORDER BY created_at DESC LIMIT 500`, [userId])).rows;
   const last = u && u.daily_last_at ? new Date(u.daily_last_at).getTime() : 0;
   const remaining = Math.max(0, last + DAILY_MS - Date.now());
   return {
@@ -453,7 +509,8 @@ app.post('/api/spin', auth, limit('spin', 12, 10000), wrap(async (req, res) => {
     const afterSpend = Number(u.stars) - total;
 
     const list = [];
-    for (let i = 0; i < mult; i++) list.push(rollOne(w.prizes));
+    const demo = DEMO_MODE && (req.body || {}).demo === true;
+    for (let i = 0; i < mult; i++) list.push(demo ? rollDemo(w.prizes) : rollOne(w.prizes));
     const g = await grantPrizes(c, req.user, list);
 
     const upd = await c.query(
@@ -474,7 +531,7 @@ app.post('/api/daily', auth, limit('daily', 6, 10000), wrap(async (req, res) => 
     const last = u.daily_last_at ? new Date(u.daily_last_at).getTime() : 0;
     const remaining = last + DAILY_MS - Date.now();
     if (remaining > 0) throw fail(429, 'DAILY_COOLDOWN', 'Daily gift is on cooldown', { remaining_ms: remaining });
-    const g = await grantPrizes(c, req.user, [rollOne(w.prizes)]);
+    const g = await grantPrizes(c, req.user, [DEMO_MODE && (req.body || {}).demo === true ? rollDemo(w.prizes) : rollOne(w.prizes)]);
     const upd = await c.query(
       `UPDATE users SET daily_last_at = NOW(), stars = stars + $2, coins = coins + $3, updated_at = NOW() WHERE user_id = $1 RETURNING *`,
       [req.user.id, g.stars, g.coins]);
@@ -495,11 +552,19 @@ app.post('/api/prizes/:id/convert', auth, limit('convert', 30, 10000), wrap(asyn
       `UPDATE prizes SET status = 'converted', updated_at = NOW()
         WHERE prize_id = $1 AND user_id = $2 AND status = 'pending' RETURNING gift_name`, [req.params.id, req.user.id]);
     if (!p.rowCount) throw fail(409, 'NOT_CONVERTIBLE', 'This prize can no longer be converted');
-    const value = CFG.coinValues[p.rows[0].gift_name];
-    if (!value) throw new Error(`no coin value for ${p.rows[0].gift_name}`);
+    const gift = p.rows[0].gift_name;
+    // NFT gifts convert into STARS, everyday gifts into COINS.
+    const starValue = convertValues[gift] || 0;
+    if (starValue > 0) {
+      const upd = await c.query('UPDATE users SET stars = stars + $2, updated_at = NOW() WHERE user_id = $1 RETURNING *', [req.user.id, starValue]);
+      await addLedger(c, req.user.id, 'convert', starValue, 0, { gift, prize_id: req.params.id, into: 'stars' });
+      return { stars: starValue, coins: 0, currency: 'stars', balance: bal(upd.rows[0]) };
+    }
+    const value = CFG.coinValues[gift];
+    if (!value) throw new Error(`no coin value for ${gift}`);
     const upd = await c.query('UPDATE users SET coins = coins + $2, updated_at = NOW() WHERE user_id = $1 RETURNING *', [req.user.id, value]);
-    await addLedger(c, req.user.id, 'convert', 0, value, { gift: p.rows[0].gift_name, prize_id: req.params.id });
-    return { coins: value, balance: bal(upd.rows[0]) };
+    await addLedger(c, req.user.id, 'convert', 0, value, { gift, prize_id: req.params.id, into: 'coins' });
+    return { stars: 0, coins: value, currency: 'coins', balance: bal(upd.rows[0]) };
   });
   res.json(out);
 }));
@@ -754,14 +819,30 @@ if(K)load();
 </script></body></html>`;
 
 // ---------------------------------------------------------------------------
+const rocket = require('./rocket').createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail, requireSubscription });
+rocket.routes(app, { auth, limit, wrap });
+// Deployed commit (Railway sets RAILWAY_GIT_COMMIT_SHA for GitHub deploys); shown in the app's version tag.
+publicConfig.version = { commit: String(process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || '').slice(0, 7) || null };
+publicConfig.rocket = rocket.publicConfig();
+const battle = require('./battle').createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, requireSubscription, nftPrice: (n) => convertValues[n] || 0 });
+battle.routes(app, { auth, limit, wrap });
+publicConfig.battle = battle.publicConfig();
+if (DEMO_MODE) { publicConfig.demoMode = true; console.warn('🧪 DEMO_MODE is ON — clients can force NFT wins. Never enable this in production.'); }
+
 (async () => {
   try {
     await initDatabase();
+    await rocket.init();
+    await battle.init();
     await notifier.init();
     app.listen(PORT, () => {
+      if (!BOT_URL) console.error('🚨 BOT_URL is not set — Telegram Stars purchases will NOT be delivered to players. Set BOT_URL to the main bot (VGServers) URL.');
+      if (!TON_API_URL) console.error('⚠️ TON_API_URL is not set — TON deposits will NOT be delivered.');
       console.log(`🎮 Game server on :${PORT}  (subscription gate ${ENFORCE_SUB ? 'ON' : 'off'}, stars via bot ${BOT_URL ? 'ON' : 'off'}, TON ${TON_API_URL ? 'ON' : 'off'})`);
       if (!ADMIN_API_KEY) console.warn('⚠️  ADMIN_API_KEY not set — /admin routes are disabled');
       notifier.start();
+      rocket.start();
+      battle.start();
     });
   } catch (e) {
     console.error('❌ startup failed:', e);
