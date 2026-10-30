@@ -251,13 +251,6 @@ function promoAccess(u) {
 // ---------------------------------------------------------------------------
 // Rolling & prize creation
 // ---------------------------------------------------------------------------
-// DEMO mode (dev only): env DEMO_MODE=on lets a client ask for a guaranteed random NFT on wheel spins.
-// With the env var unset (main / production) the flag is ignored and not even advertised.
-const DEMO_MODE = process.env.DEMO_MODE === 'on';
-function rollDemo(prizes) {
-  const nfts = prizes.filter((p) => p.type === 'gift' && NFT_SET.has(p.value));
-  return nfts.length ? nfts[crypto.randomInt(0, nfts.length)] : rollOne(prizes);
-}
 function rollOne(prizes) {
   const r = crypto.randomInt(0, 1_000_000_000) / 1e7;       // uniform in [0, 100)
   let cum = 0;
@@ -509,8 +502,7 @@ app.post('/api/spin', auth, limit('spin', 12, 10000), wrap(async (req, res) => {
     const afterSpend = Number(u.stars) - total;
 
     const list = [];
-    const demo = DEMO_MODE && (req.body || {}).demo === true;
-    for (let i = 0; i < mult; i++) list.push(demo ? rollDemo(w.prizes) : rollOne(w.prizes));
+    for (let i = 0; i < mult; i++) list.push(rollOne(w.prizes));
     const g = await grantPrizes(c, req.user, list);
 
     const upd = await c.query(
@@ -531,7 +523,7 @@ app.post('/api/daily', auth, limit('daily', 6, 10000), wrap(async (req, res) => 
     const last = u.daily_last_at ? new Date(u.daily_last_at).getTime() : 0;
     const remaining = last + DAILY_MS - Date.now();
     if (remaining > 0) throw fail(429, 'DAILY_COOLDOWN', 'Daily gift is on cooldown', { remaining_ms: remaining });
-    const g = await grantPrizes(c, req.user, [DEMO_MODE && (req.body || {}).demo === true ? rollDemo(w.prizes) : rollOne(w.prizes)]);
+    const g = await grantPrizes(c, req.user, [rollOne(w.prizes)]);
     const upd = await c.query(
       `UPDATE users SET daily_last_at = NOW(), stars = stars + $2, coins = coins + $3, updated_at = NOW() WHERE user_id = $1 RETURNING *`,
       [req.user.id, g.stars, g.coins]);
@@ -827,7 +819,6 @@ publicConfig.rocket = rocket.publicConfig();
 const battle = require('./battle').createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, requireSubscription, nftPrice: (n) => convertValues[n] || 0 });
 battle.routes(app, { auth, limit, wrap });
 publicConfig.battle = battle.publicConfig();
-if (DEMO_MODE) { publicConfig.demoMode = true; console.warn('🧪 DEMO_MODE is ON — clients can force NFT wins. Never enable this in production.'); }
 
 (async () => {
   try {
