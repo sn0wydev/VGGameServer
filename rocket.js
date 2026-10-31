@@ -54,7 +54,9 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
 
   // ---- item values & upgrade tiers -------------------------------------------------
   const starValues = CFG.starValues || {};
-  const valueOf = (name) => (NFT_SET.has(name) ? Number(starValues[name]) : Number(CFG.coinValues[name])) || 0;
+  const basic = (CFG.battle && CFG.battle.basicValues) || {};
+  const valueOf = (name) => (NFT_SET.has(name) ? Number(starValues[name]) : Number(basic[name] ?? CFG.coinValues[name])) || 0;
+  const itemMin = (name) => (NFT_SET.has(name) ? R.minBet : Math.min(R.minBet, ...Object.values(basic).map(Number).filter((v) => v > 0)));
   const giftTiers = Object.keys(CFG.coinValues).filter((n) => !NFT_SET.has(n)).map((n) => ({ n, v: valueOf(n) })).sort((a, b) => a.v - b.v);
   const nftNames = (Array.isArray(R.nftTiers) ? R.nftTiers : CFG.nftGifts).filter((n) => NFT_SET.has(n) && valueOf(n) > 0 && valueOf(n) <= R.maxUpgradeValue);
   const nftTiers = nftNames.map((n) => ({ n, v: valueOf(n) })).sort((a, b) => a.v - b.v);
@@ -206,10 +208,10 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
         await c.query(`UPDATE prizes SET status = 'rocket_done', updated_at = NOW() WHERE prize_id = $1 AND status = 'staked'`, [b.prizeId]);
         const newId = await createGift(c, { id: b.userId, username: b.username }, o.to);
         if (o.rem > 0) {
-          await c.query(`UPDATE users SET ${o.isNft ? 'stars' : 'coins'} = ${o.isNft ? 'stars' : 'coins'} + $2, updated_at = NOW() WHERE user_id = $1`, [b.userId, o.rem]);
+          await c.query('UPDATE users SET stars = stars + $2, updated_at = NOW() WHERE user_id = $1', [b.userId, o.rem]);
         }
-        await addLedger(c, b.userId, 'rocket:win', o.isNft ? o.rem : 0, o.isNft ? 0 : o.rem, { round: round.id, bet: b.id, from: b.item, to: o.to, at: m, prize_id: newId }, `rocket:win:${b.id}`);
-        result = { from: b.item, to: o.to, prize_id: newId, ...(o.isNft ? { stars: o.rem } : { coins: o.rem }) };
+        await addLedger(c, b.userId, 'rocket:win', o.rem, 0, { round: round.id, bet: b.id, from: b.item, to: o.to, at: m, prize_id: newId }, `rocket:win:${b.id}`);
+        result = { from: b.item, to: o.to, prize_id: newId, stars: o.rem };
       }
       await c.query('UPDATE rocket_bets SET result = $2 WHERE id = $1', [b.id, JSON.stringify(result)]);
       const u = (await c.query('SELECT * FROM users WHERE user_id = $1', [b.userId])).rows[0];
@@ -262,7 +264,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
         const p = await c.query(`UPDATE prizes SET status = 'staked', updated_at = NOW() WHERE prize_id = $1 AND user_id = $2 AND status = 'pending' RETURNING gift_name`, [prizeId, user.id]);
         if (!p.rowCount) throw fail(409, 'ITEM_UNAVAILABLE', 'This item is not available to bet');
         item = p.rows[0].gift_name;
-        if (valueOf(item) < R.minBet) throw fail(400, 'BELOW_MIN', `This item is worth less than the ${R.minBet} Stars minimum`, { min: R.minBet });
+        if (valueOf(item) < itemMin(item)) throw fail(400, 'BELOW_MIN', `This item is worth less than the ${itemMin(item)} Stars minimum`, { min: itemMin(item) });
         kind = NFT_SET.has(item) ? 'nft' : 'gift';
       } else {
         if (Number(locked.stars) < amount) throw fail(402, 'INSUFFICIENT_STARS', 'Not enough Stars', { need: amount, have: Number(locked.stars) });
