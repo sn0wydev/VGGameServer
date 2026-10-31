@@ -32,7 +32,7 @@ const DEFAULTS = {
   minBet: 50,            // Stars (and minimum value of a staked item)
   maxBet: 20000,         // Stars
   growth: 0.11,          // m(t) = e^(growth * t)
-  edge: 0.97,            // 0.97 = 3% house edge (players get back ~97% of Stars staked over time)
+  edge: 0.90,            // 0.90 = 10% house edge (players get back ~90% of Stars staked over time)
   maxMultiplier: 500,
   betSeconds: 8,
   crashPauseSeconds: 4,
@@ -45,6 +45,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
   const E = process.env;
   const R = { ...DEFAULTS, ...(CFG.rocket || {}) };
   if (E.ROCKET === 'off') R.enabled = false;
+  if (E.ROCKET_EDGE && Number(E.ROCKET_EDGE) > 0 && Number(E.ROCKET_EDGE) <= 1) R.edge = Number(E.ROCKET_EDGE);
   if (E.NODE_ENV === 'test') {   // tests only: speed things up / force crash points
     if (E.ROCKET_BET_SECONDS) R.betSeconds = Number(E.ROCKET_BET_SECONDS);
     if (E.ROCKET_PAUSE_SECONDS) R.crashPauseSeconds = Number(E.ROCKET_PAUSE_SECONDS);
