@@ -17,7 +17,13 @@
 //  ENV (Railway variables)
 //    DATABASE_URL            same Postgres as prize-store                    (required)
 //    BOT_TOKEN               the mini-app bot's token (verifies initData)    (required)
-//    ADMIN_API_KEY           protects /admin/* and /admin/panel              (required for admin)
+//    ADMIN_API_KEY           protects /admin/* and /admin/panel              (required for admin, unless ADMIN_TELEGRAM_IDS is set)
+//    ADMIN_TELEGRAM_IDS      numeric Telegram ids allowed into /admin/panel, comma separated. When set, the panel
+//                            needs "Log in with Telegram" (the key alone no longer works). Needs /setdomain in BotFather.
+//    ADMIN_KEY_LOGIN         "on" = the key alone also works (emergency access). default off
+//    ADMIN_REQUIRE_KEY       "on" = a Telegram login AND the key are both needed. default off
+//    ADMIN_SESSION_HOURS     how long a panel login lasts (default 12)
+//    BOT_USERNAME            optional, bot username for the login button (read from Telegram when empty)
 //    BOT_URL                 main bot service (VGServers) base URL. Used to collect
 //                            Telegram-Stars purchases and to check channel subscription
 //    TON_API_URL             TON payments service base URL (collects TON purchases)
@@ -610,12 +616,85 @@ app.post('/api/promo', auth, limit('promo', 8, 60000), wrap(async (req, res) => 
 // ---------------------------------------------------------------------------
 // Admin
 // ---------------------------------------------------------------------------
+// Admin sign-in. Telegram Login (by numeric ID) when ADMIN_TELEGRAM_IDS is set; the old key-only mode otherwise.
+const ADMIN_IDS = new Set(String(process.env.ADMIN_TELEGRAM_IDS || '').split(/[\s,;]+/).filter((s) => /^\d{1,15}$/.test(s)));
+const ADMIN_KEY_LOGIN = String(process.env.ADMIN_KEY_LOGIN || 'off').toLowerCase() === 'on';
+const ADMIN_REQUIRE_KEY = String(process.env.ADMIN_REQUIRE_KEY || 'off').toLowerCase() === 'on';
+const ADMIN_SESSION_HOURS = Math.max(1, Math.min(72, Number(process.env.ADMIN_SESSION_HOURS) || 12));
+const b64u = (b) => Buffer.from(b).toString('base64url');
+const adminSecret = () => crypto.createHmac('sha256', BOT_TOKEN).update('vg-admin-session-v1').digest();
+function adminSign(payload) { const p = b64u(JSON.stringify(payload)); return p + '.' + b64u(crypto.createHmac('sha256', adminSecret()).update(p).digest()); }
+function adminSession(req) {
+  const m = /(?:^|;\s*)vg_admin=([^;]+)/.exec(req.get('cookie') || ''); if (!m) return null;
+  const [p, sig] = m[1].split('.'); if (!p || !sig) return null;
+  const want = b64u(crypto.createHmac('sha256', adminSecret()).update(p).digest());
+  if (sig.length !== want.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return null;
+  let s; try { s = JSON.parse(Buffer.from(p, 'base64url').toString()); } catch { return null; }
+  if (!s || !(s.e > Date.now() / 1000) || !ADMIN_IDS.has(String(s.i))) return null;    // expired, or removed from the allow-list since
+  return s;
+}
+function verifyTelegramLogin(q) {
+  const hash = String(q.hash || ''); if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+  const dcs = Object.keys(q).filter((k) => k !== 'hash').sort().map((k) => `${k}=${q[k]}`).join('\n');
+  const secret = crypto.createHash('sha256').update(BOT_TOKEN).digest();
+  const want = crypto.createHmac('sha256', secret).update(dcs).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(want), Buffer.from(hash))) return null;
+  const age = Date.now() / 1000 - (parseInt(q.auth_date, 10) || 0);
+  if (!(age >= -30 && age <= 600)) return null;                                          // login links are good for 10 minutes
+  const id = String(q.id || ''); return /^\d{1,15}$/.test(id) ? { id, name: String(q.first_name || q.username || id).slice(0, 60) } : null;
+}
+let _botName = null;
+async function botUsername() {
+  if (process.env.BOT_USERNAME) return String(process.env.BOT_USERNAME).replace(/^@/, '');
+  if (_botName) return _botName;
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, { signal: AbortSignal.timeout(6000) });
+  const j = await r.json(); if (!j.ok || !j.result?.username) throw new Error('getMe failed');
+  return (_botName = j.result.username);
+}
+const adminPage = (t) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#0b0b14;color:#e8e8f4;font:16px system-ui;display:grid;place-items:center;min-height:90vh;text-align:center"><div><h2>${t}</h2><a style="color:#9d8cff" href="/admin/panel">Back</a></div>`;
+app.get('/admin/auth/telegram', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!ADMIN_IDS.size) return res.status(503).type('html').send(adminPage('Telegram sign-in is not set up'));
+  if (!hit(`admlogin:${req.ip}`, 10, 60000)) return res.status(429).type('html').send(adminPage('Too many attempts, wait a minute'));
+  const u = verifyTelegramLogin(req.query);
+  if (!u) return res.status(403).type('html').send(adminPage('Login could not be verified'));
+  if (!ADMIN_IDS.has(u.id)) { console.warn('admin sign-in denied for Telegram id', u.id); return res.status(403).type('html').send(adminPage('This Telegram account is not allowed')); }
+  const exp = Math.floor(Date.now() / 1000) + ADMIN_SESSION_HOURS * 3600;
+  res.append('Set-Cookie', `vg_admin=${adminSign({ i: u.id, n: u.name, e: exp })}; Path=/admin; Max-Age=${ADMIN_SESSION_HOURS * 3600}; HttpOnly; SameSite=Strict${req.secure ? '; Secure' : ''}`);
+  console.log('admin sign-in', u.id);
+  res.redirect(302, '/admin/panel');
+});
+app.get('/admin/me', wrap(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hit(`admme:${req.ip}`, 60, 60000)) return res.status(429).json({ error: 'Too many requests' });
+  const s = adminSession(req); if (s) return res.json({ id: s.i, name: s.n });
+  const bot = ADMIN_IDS.size ? await botUsername().catch(() => null) : null;
+  res.status(401).json({ error: 'Not signed in', login: { enabled: ADMIN_IDS.size > 0, bot, keyLogin: !ADMIN_IDS.size || ADMIN_KEY_LOGIN } });
+}));
+app.post('/admin/logout', (req, res) => {
+  if (req.get('x-admin-req') !== '1') return res.status(403).json({ error: 'Missing X-Admin-Req header' });
+  res.append('Set-Cookie', `vg_admin=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict${req.secure ? '; Secure' : ''}`);
+  res.json({ ok: true });
+});
 function adminAuth(req, res, next) {
-  if (!ADMIN_API_KEY) return res.status(503).json({ error: 'ADMIN_API_KEY is not set on the server' });
   if (!hit(`adm:${req.ip}`, 60, 60000)) return res.status(429).json({ error: 'Too many requests' });
-  const k = Buffer.from(String(req.get('x-admin-key') || ''));
-  const a = Buffer.from(ADMIN_API_KEY);
-  if (k.length !== a.length || !crypto.timingSafeEqual(k, a)) return res.status(401).json({ error: 'Bad admin key' });
+  const keyOk = () => {
+    if (!ADMIN_API_KEY) return false;
+    const k = Buffer.from(String(req.get('x-admin-key') || '')), a = Buffer.from(ADMIN_API_KEY);
+    return k.length === a.length && crypto.timingSafeEqual(k, a);
+  };
+  if (ADMIN_IDS.size) {
+    const s = adminSession(req);
+    if (s) {
+      if (req.method !== 'GET' && req.get('x-admin-req') !== '1') return res.status(403).json({ error: 'Missing X-Admin-Req header' });
+      if (ADMIN_REQUIRE_KEY && !keyOk()) return res.status(401).json({ error: 'The admin key is also required' });
+      req.adminId = s.i; return next();
+    }
+    if (ADMIN_KEY_LOGIN && keyOk()) { req.adminId = null; return next(); }
+    return res.status(401).json({ error: 'Sign in with Telegram', login: true });
+  }
+  if (!ADMIN_API_KEY) return res.status(503).json({ error: 'ADMIN_API_KEY is not set on the server' });
+  if (!keyOk()) return res.status(401).json({ error: 'Bad admin key' });
   next();
 }
 
@@ -739,7 +818,7 @@ app.post('/admin/users/:id/grant', adminAuth, wrap(async (req, res) => {
       [req.params.id, stars, coins])).rows[0];
     let prize_id = null;
     if (gift) prize_id = await createGift(c, { id: req.params.id, username: u.username }, gift);
-    await addLedger(c, req.params.id, 'admin:grant', stars, coins, { gift, prize_id, note },
+    await addLedger(c, req.params.id, 'admin:grant', stars, coins, { gift, prize_id, note, by: req.adminId || null },
       `admin:${req.params.id}:${Date.now()}:${crypto.randomInt(1e6)}`);
     await c.query('COMMIT');
     res.json({ user_id: req.params.id, stars: Number(u.stars), coins: Number(u.coins), prize_id });
@@ -751,7 +830,11 @@ app.get('/admin/users/:id', adminAuth, wrap(async (req, res) => {
   res.json({ user: u || null, promo_access: u ? promoAccess(u) : null, ledger: l });
 }));
 
-app.get('/admin/panel', (req, res) => res.type('html').send(ADMIN_PANEL_HTML));
+app.get('/admin/panel', (req, res) => {
+  res.set({ 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY',
+    'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline' https://telegram.org; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; frame-src https://oauth.telegram.org; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" });
+  res.type('html').send(ADMIN_PANEL_HTML);
+});
 
 // ---------------------------------------------------------------------------
 const ADMIN_PANEL_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -764,7 +847,9 @@ table{width:100%;border-collapse:collapse;margin-top:14px}th,td{text-align:left;
 .tag{padding:2px 9px;border-radius:99px;font-size:.78rem}.active{background:#17402c;color:#7dffb0}.disabled{background:#33333f;color:#aaa}.expired{background:#4a1d2c;color:#ff9db5}.scheduled{background:#403a17;color:#ffe27d}.used_up{background:#4a2f1d;color:#ffbf8a}
 .card{background:#10101e;border:1px solid #23233e;border-radius:14px;padding:14px;margin-top:14px}small{color:#8a8ab0}.acts{display:flex;gap:6px;flex-wrap:wrap}
 </style></head><body><h1>🎟 Promocodes</h1>
-<div class="card"><div class="row"><label>Admin key<input id="key" type="password" placeholder="ADMIN_API_KEY" style="min-width:260px"></label><button id="load">Load</button><small id="msg"></small></div></div>
+<div class="card"><div class="row" id="signed" style="display:none;align-items:center"><b id="who"></b><button id="logout">Sign out</button></div>
+<div id="loginBox" style="display:none"><b>Sign in</b> <small>Only Telegram accounts on the allow-list (by numeric ID) can open this panel.</small><div id="tgBtn" style="margin-top:10px;min-height:40px"></div><small id="loginMsg"></small></div>
+<div class="row" id="keyRow" style="display:none"><label>Admin key<input id="key" type="password" placeholder="ADMIN_API_KEY" style="min-width:260px"></label><button id="load">Load</button></div><small id="msg"></small></div>
 <div class="card"><b>Create / update a code</b> <small>(same code = overwrite)</small>
 <div class="row"><label>Code<input id="f_code" placeholder="SUMMER50"></label><label>Coins<input id="f_coins" type="number" min="0" value="0" style="width:90px"></label><label>Stars<input id="f_stars" type="number" min="0" value="0" style="width:90px"></label>
 <label>Gift (optional)<select id="f_gift"><option value="">— none —</option></select></label><label>Max uses<input id="f_max" type="number" min="1" placeholder="unlimited" style="width:110px"></label></div>
@@ -779,10 +864,10 @@ table{width:100%;border-collapse:collapse;margin-top:14px}th,td{text-align:left;
 <table><thead><tr><th>Code</th><th>Status</th><th>Rewards</th><th>Uses</th><th>Window</th><th></th></tr></thead><tbody id="rows"></tbody></table>
 <script>
 const $=id=>document.getElementById(id);let K=sessionStorage.getItem('k')||'';$('key').value=K;
-const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json','X-Admin-Key':K},body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
+const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:Object.assign({'Content-Type':'application/json','X-Admin-Req':'1'},K?{'X-Admin-Key':K}:{}),body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
 const say=(t,bad)=>{$('msg').textContent=t;$('msg').style.color=bad?'#ff9db5':'#7dffb0'};
 const fmt=d=>d?new Date(d).toLocaleString():'—';
-async function load(){K=$('key').value.trim();sessionStorage.setItem('k',K);try{const j=await api('GET','/admin/promos');
+async function load(){K=$('key').value.trim();if(K)sessionStorage.setItem('k',K);try{const j=await api('GET','/admin/promos');
  if($('f_gift').options.length<2)j.valid_gifts.forEach(g=>{$('f_gift').add(new Option(g,g));$('g_gift').add(new Option(g,g))});
  $('rows').innerHTML=j.promos.map(p=>{const rw=[p.coins>0?p.coins+' coins':'',p.stars>0?p.stars+' ⭐':'',...(p.gifts||[])].filter(Boolean).join(', ');
  return '<tr><td><b>'+p.code+'</b><br><small>'+(p.note||'')+'</small></td><td><span class="tag '+p.status+'">'+p.status.replace('_',' ')+'</span></td><td>'+rw+'</td><td>'+p.uses+(p.max_uses!=null?' / '+p.max_uses:'')+'</td><td><small>'+fmt(p.starts_at)+' →<br>'+fmt(p.expires_at)+'</small></td><td class="acts">'
@@ -807,7 +892,14 @@ for(const [id,v] of [['u_allow',true],['u_block',false],['u_auto',null]])$(id).o
 $('u_bulkgo').onclick=async()=>{K=$('key').value.trim();try{const ids=$('u_bulk').value.split(/[\\s,;]+/).filter(Boolean);const j=await api('POST','/admin/promo-access/bulk',{user_ids:ids,allowed:true});umsg('Allowed '+j.updated+' accounts')}catch(e){umsg(e.message,1)}};
 const gmsg=(t,bad)=>{$('g_msg').textContent=t;$('g_msg').style.color=bad?'#ff9db5':'#7dffb0'};
 $('g_go').onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+$('g_id').value.trim()+'/grant',{stars:+$('g_stars').value,coins:+$('g_coins').value,gift:$('g_gift').value});gmsg('Done. Balance now '+j.stars+' ⭐, '+j.coins+' coins'+(j.prize_id?'. Prize '+j.prize_id:''))}catch(e){gmsg(e.message,1)}};
-if(K)load();
+$('logout').onclick=async()=>{try{await api('POST','/admin/logout')}catch(e){}location.reload()};
+(async()=>{try{const r=await fetch('/admin/me',{credentials:'same-origin'});const j=await r.json();
+ if(r.ok){$('signed').style.display='flex';$('who').textContent='Signed in as '+j.name+' (ID '+j.id+')';K='';load();return}
+ const L=j.login||{};
+ if(L.enabled&&L.bot){$('loginBox').style.display='block';const s=document.createElement('script');s.async=true;s.src='https://telegram.org/js/telegram-widget.js?22';s.setAttribute('data-telegram-login',L.bot);s.setAttribute('data-size','large');s.setAttribute('data-auth-url','/admin/auth/telegram');$('tgBtn').appendChild(s)}
+ else if(L.enabled){$('loginBox').style.display='block';$('loginMsg').textContent='Could not read the bot name from Telegram. Set BOT_USERNAME on the server.'}
+ if(L.keyLogin){$('keyRow').style.display='flex';if(K)load()}
+}catch(e){say(e.message,1)}})();
 </script></body></html>`;
 
 // ---------------------------------------------------------------------------
@@ -830,7 +922,9 @@ publicConfig.battle = battle.publicConfig();
       if (!BOT_URL) console.error('🚨 BOT_URL is not set — Telegram Stars purchases will NOT be delivered to players. Set BOT_URL to the main bot (VGServers) URL.');
       if (!TON_API_URL) console.error('⚠️ TON_API_URL is not set — TON deposits will NOT be delivered.');
       console.log(`🎮 Game server on :${PORT}  (subscription gate ${ENFORCE_SUB ? 'ON' : 'off'}, stars via bot ${BOT_URL ? 'ON' : 'off'}, TON ${TON_API_URL ? 'ON' : 'off'})`);
-      if (!ADMIN_API_KEY) console.warn('⚠️  ADMIN_API_KEY not set — /admin routes are disabled');
+      if (ADMIN_IDS.size) console.log(`🔐 Admin panel: Telegram login for ${ADMIN_IDS.size} id(s)${ADMIN_KEY_LOGIN ? ' + key access ON' : ''}${ADMIN_REQUIRE_KEY ? ' + key required' : ''}`);
+      else if (!ADMIN_API_KEY) console.warn('⚠️  ADMIN_API_KEY not set — /admin routes are disabled');
+      else console.warn('⚠️  Admin panel is protected by the key only. Set ADMIN_TELEGRAM_IDS to require a Telegram login.');
       notifier.start();
       rocket.start();
       battle.start();
