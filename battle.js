@@ -29,15 +29,21 @@ const DEFAULTS = {
   betSeconds: 30,        // countdown that starts with the first gift
   spinSeconds: 8,
   resultSeconds: 7,
-  maxPlayers: 25,
+  maxPlayers: 0,         // 0 = no limit (set a number to cap a round again)
   maxItemsPerPlayer: 5,
   minItemValue: 1,
   stripTiles: 70,        // tiles on the reel (more players' tiles in proportion to their chance)
+  // House fee on the whole pot, paid in gifts taken from the OTHER players' stakes (battles are gifts-only).
+  // The winner's chance decides it: freeAtChance or more = no fee; the lower the chance, the closer to maxPct.
+  // Linear: pct = maxPct x (1 - chance / freeAtChance). Set fee.enabled:false (or maxPct:0) to switch it off.
+  fee: { enabled: true, maxPct: 10, freeAtChance: 0.9 },
 };
 
-function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, requireSubscription }) {
+function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, requireSubscription, nftPrice }) {
   const E = process.env;
   const R = { ...DEFAULTS, ...(CFG.battle || {}) };
+  R.fee = { ...DEFAULTS.fee, ...((CFG.battle || {}).fee || {}) };
+  if (E.BATTLE_FEE === 'off') R.fee.enabled = false;
   if (E.BATTLE === 'off') R.enabled = false;
   if (E.NODE_ENV === 'test') {
     if (E.BATTLE_BET_SECONDS) R.betSeconds = Number(E.BATTLE_BET_SECONDS);
@@ -47,7 +53,25 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
   const forcedR = E.NODE_ENV === 'test' && E.BATTLE_TEST_R ? E.BATTLE_TEST_R.split(',').map(Number) : [];
 
   const starValues = CFG.starValues || {};
-  const valueOf = (name) => (NFT_SET.has(name) ? Number(starValues[name]) : Number(CFG.coinValues[name])) || 0;
+  const basic = (CFG.battle && CFG.battle.basicValues) || {};
+  // NFTs count at their current MARKET price (the relayer's buyback board, same numbers as 'convert to Stars'); if no market price is known, at starValues.
+  const valueOf = (name) => (NFT_SET.has(name) ? (Number(nftPrice && nftPrice(name)) || Number(starValues[name])) : Number(basic[name] ?? CFG.coinValues[name])) || 0;
+
+  // ---- house fee ----------------------------------------------------------------------
+  function feePctFor(chance) {
+    const f = R.fee; if (!f.enabled || !(f.maxPct > 0) || chance >= f.freeAtChance) return 0;
+    return Math.round(f.maxPct * (1 - chance / f.freeAtChance) * 100) / 100;      // percent, 2 decimals
+  }
+  // Which gifts the house keeps: from the other players' gifts, as many as fit under the fee value (biggest first, never over).
+  function pickFeeItems(players, winner, total, chance) {
+    const pct = feePctFor(chance), target = Math.floor(total * pct / 100);
+    const kept = []; let value = 0;
+    if (target > 0) {
+      const pool = players.filter((p) => p !== winner).flatMap((p) => p.items).sort((a, b) => b.value - a.value);
+      for (const it of pool) if (value + it.value <= target) { kept.push(it); value += it.value; }
+    }
+    return { pct, target, value, kept };
+  }
 
   // ---- fairness / math ---------------------------------------------------------------
   const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -66,12 +90,12 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
   // The reel: tiles of every player in proportion to their chance (each player at least once),
   // shuffled, with a tile of the winner at index `winnerTile` where the line will stop.
   function buildStrip(values, winnerIdx, secret) {
-    const N = R.stripTiles, total = values.reduce((a, b) => a + b, 0), rnd = seededRand(secret);
+    const N = Math.max(R.stripTiles, values.length * 3), total = values.reduce((a, b) => a + b, 0), rnd = seededRand(secret);   // no player cap: keep room for every player
     const exact = values.map((v) => (v / total) * N), counts = exact.map((x) => Math.max(1, Math.floor(x)));
     let diff = N - counts.reduce((a, b) => a + b, 0);
     const order = exact.map((x, i) => [x - Math.floor(x), i]).sort((a, b) => b[0] - a[0]).map((p) => p[1]);
     for (let k = 0; diff > 0; k++, diff--) counts[order[k % order.length]]++;
-    for (let k = 0; diff < 0; k++) { const i = order[order.length - 1 - (k % order.length)]; if (counts[i] > 1) { counts[i]--; diff++; } }
+    for (let k = 0; diff < 0 && k < N * 20; k++) { const i = order[order.length - 1 - (k % order.length)]; if (counts[i] > 1) { counts[i]--; diff++; } }   // guarded: can never spin forever
     const strip = []; counts.forEach((c, i) => { for (let j = 0; j < c; j++) strip.push(i); });
     for (let i = strip.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [strip[i], strip[j]] = [strip[j], strip[i]]; }
     const winnerTile = strip.length - 12;
@@ -92,7 +116,7 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
   function playersView(userId) {
     if (!round) return [];
     const list = [...round.players.values()], total = list.reduce((a, p) => a + p.value, 0) || 1;
-    return list.map((p) => ({ name: p.name, avatar: p.avatar, value: p.value, chance: p.value / total, items: p.items.map((i) => i.item), me: p.userId === userId }));
+    return list.map((p) => ({ name: p.name, avatar: p.avatar, value: p.value, chance: p.value / total, feePct: feePctFor(p.value / total), items: p.items.map((i) => i.item), me: p.userId === userId }));
   }
   function snapshot(userId) {
     const r = round, finished = r && r.phase === 'result', list = r ? [...r.players.values()] : [];
@@ -103,6 +127,7 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
       players: playersView(userId),
       spin: r && r.spin && (r.phase === 'spin' || r.phase === 'result') ? { startedAt: r.spin.startedAt, ms: R.spinSeconds * 1000, strip: r.spin.strip, winnerTile: r.spin.winnerTile, offset: r.spin.offset, winner: r.spin.winner } : null,
       secret: finished ? r.secret : null,
+      fee: { enabled: !!R.fee.enabled && R.fee.maxPct > 0, maxPct: R.fee.maxPct, freeAtChance: R.fee.freeAtChance, taken: finished && r.fee ? { pct: r.fee.pct, value: r.fee.value, items: r.fee.kept.map((i) => i.item) } : null },
       history,
     };
   }
@@ -161,15 +186,17 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
   async function finish(r) {
     const players = [...r.players.values()], winner = players[r.spin.winner], total = players.reduce((a, p) => a + p.value, 0);
     const itemCount = players.reduce((a, p) => a + p.items.length, 0);
+    const fee = pickFeeItems(players, winner, total, total > 0 ? winner.value / total : 1), feeIds = new Set(fee.kept.map((i) => i.prizeId));
+    r.fee = fee;
     try {
       await tx(async (c) => {
         const ids = players.flatMap((p) => p.items.map((i) => i.prizeId));
         await c.query(`UPDATE battle_bets SET status = CASE WHEN user_id = $2 THEN 'won' ELSE 'lost' END WHERE round_id = $1`, [r.id, winner.userId]);
         await c.query(`UPDATE prizes SET status = 'battle_done', updated_at = NOW() WHERE prize_id = ANY($1) AND status = 'staked'`, [ids]);
         const won = [];
-        for (const p of players) for (const i of p.items) won.push({ item: i.item, prize_id: await createGift(c, { id: winner.userId, username: winner.username }, i.item) });
+        for (const p of players) for (const i of p.items) if (!feeIds.has(i.prizeId)) won.push({ item: i.item, prize_id: await createGift(c, { id: winner.userId, username: winner.username }, i.item) });
         for (const p of players) {
-          if (p === winner) await addLedger(c, p.userId, 'battle:win', 0, 0, { round: r.id, gifts: won.map((x) => x.item), total }, `battle:win:${r.id}`);
+          if (p === winner) await addLedger(c, p.userId, 'battle:win', 0, 0, { round: r.id, gifts: won.map((x) => x.item), total, fee: { pct: fee.pct, value: fee.value, gifts: fee.kept.map((i) => i.item) } }, `battle:win:${r.id}`);
           else await addLedger(c, p.userId, 'battle:loss', 0, 0, { round: r.id, gifts: p.items.map((i) => i.item), value: p.value }, `battle:loss:${r.id}:${p.userId}`);
         }
         await c.query(`UPDATE battle_rounds SET winner_id = $2, winner_name = $3, winner_avatar = $4, total_value = $5, item_count = $6, players = $7, finished_at = NOW() WHERE id = $1`,
@@ -200,7 +227,7 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
       const ids = [...new Set((Array.isArray(body.prize_ids) ? body.prize_ids : []).map(String))].slice(0, 50);
       if (!ids.length) throw fail(400, 'NO_ITEMS', 'Pick at least one gift');
       const mine = r.players.get(user.id), have = mine ? mine.items.length : 0;
-      if (!mine && r.players.size >= R.maxPlayers) throw fail(409, 'ROOM_FULL', 'This round is full');
+      if (!mine && R.maxPlayers > 0 && r.players.size >= R.maxPlayers) throw fail(409, 'ROOM_FULL', 'This round is full');
       if (have + ids.length > R.maxItemsPerPlayer) throw fail(400, 'TOO_MANY_ITEMS', `You can bet up to ${R.maxItemsPerPlayer} gifts per round`, { max: R.maxItemsPerPlayer });
 
       const out = await tx(async (c) => {
@@ -256,7 +283,8 @@ function createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, req
   }
 
   function start() { if (started || !R.enabled) return; started = true; newRound().catch((e) => { console.error('🚨 battle could not start:', e); started = false; }); }
-  const publicConfig = () => ({ enabled: R.enabled, maxPlayers: R.maxPlayers, maxItems: R.maxItemsPerPlayer, betSeconds: R.betSeconds, spinSeconds: R.spinSeconds });
+  const publicConfig = () => ({ enabled: R.enabled, maxPlayers: R.maxPlayers, maxItems: R.maxItemsPerPlayer, betSeconds: R.betSeconds, spinSeconds: R.spinSeconds,
+    get values() { const v = { ...basic }; for (const n of NFT_SET) { const x = valueOf(n); if (x > 0) v[n] = x; } return v; } });
 
   return { init, start, routes, publicConfig, pickWinner, buildStrip, rFromSecret, enabled: R.enabled };
 }
