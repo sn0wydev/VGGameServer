@@ -92,7 +92,7 @@ module.exports = {
     minBet: 50,
     maxBet: 20000,
     growth: 0.11,          // m(t) = e^(0.11 t)
-    edge: 0.97,            // 3% house edge
+    edge: 0.90,            // 10% house edge: P(crash >= x) = 0.90 / x  (0.97 was the old 3%)
     maxMultiplier: 500,
     betSeconds: 8,
     crashPauseSeconds: 4,
@@ -105,9 +105,15 @@ module.exports = {
     betSeconds: 30,        // countdown that starts when the first gift is placed
     spinSeconds: 8,
     resultSeconds: 7,
-    maxPlayers: 25,
+    maxPlayers: 0,         // 0 = no limit on players per round
     maxItemsPerPlayer: 5,
     minItemValue: 1,
+    // House fee, taken in gifts out of the OTHER players' stakes. No fee when the winner held freeAtChance (90%) or more;
+    // below that it grows linearly up to maxPct at ~0% chance:  pct = maxPct x (1 - chance / freeAtChance).
+    fee: { enabled: true, maxPct: 10, freeAtChance: 0.9 },
+    // What everyday (non-NFT) gifts count for INSIDE Gift Battle: their real Telegram Star prices. NFTs use starValues.
+    // A gift missing here falls back to its coin value. Wheels, Rocket and converting are not affected.
+    basicValues: { Heart: 15, Bear: 15, Rose: 25, Gift: 25, Cake: 50, "Rose Bouquet": 50, Champagne: 50, Rocket: 50, Ring: 100, Trophy: 100, Diamond: 100 },
   },
 
   wheels: {
