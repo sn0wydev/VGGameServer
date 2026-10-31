@@ -92,7 +92,7 @@ module.exports = {
     minBet: 50,
     maxBet: 20000,
     growth: 0.11,          // m(t) = e^(0.11 t)
-    edge: 0.97,            // 3% house edge
+    edge: 0.90,            // 10% house edge: P(crash >= x) = 0.90 / x  (0.97 was the old 3%)
     maxMultiplier: 500,
     betSeconds: 8,
     crashPauseSeconds: 4,
