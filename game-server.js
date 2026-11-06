@@ -91,7 +91,7 @@ const NFT_SET = new Set(CFG.nftGifts);
 const DAILY_MS = Math.round((CFG.dailyCooldownHours || 24) * 3600 * 1000);
 
 // Scheduled bot messages (daily gift ready / comeback nudges) - see notifications.js
-const notifier = require('./notifications').createNotifier({ pool, botToken: BOT_TOKEN, dailyMs: DAILY_MS });
+const notifier = require('./notifications').createNotifier({ pool, botToken: BOT_TOKEN, dailyMs: DAILY_MS, onlyTesters: String(process.env.TESTERS_ONLY || 'off').toLowerCase() === 'on' });
 
 // ---------------------------------------------------------------------------
 // Telegram initData verification (same algorithm the bot and relayer use)
@@ -110,6 +110,7 @@ function verifyInitData(initData) {
   if (Date.now() / 1000 - authDate > MAX_AGE) return null;
   try {
     const u = JSON.parse(params.get('user') || 'null');
+    if (u && typeof u === 'object') u.start_param = String(params.get('start_param') || '').slice(0, 64);   // signed by Telegram, so the inviter id in it can't be forged
     return u && Number.isSafeInteger(u.id) && u.id > 0 ? u : null;
   } catch { return null; }
 }
@@ -140,9 +141,39 @@ const RATE_MULT = Number(process.env.RATE_MULT) || 1;   // raise to loosen every
 const limit = (name, n, ms) => (req, res, next) =>
   hit(`${name}:${req.user ? req.user.id : req.ip}`, n * RATE_MULT, ms) ? next() : res.status(429).json({ error: 'Too many requests, slow down', code: 'RATE_LIMITED' });
 
+// Banned accounts, kept in memory so every request can be refused without a database hit.
+// The ban/unban endpoints update it at once; a refresh every minute covers a second instance.
+const BANNED = new Set();
+async function loadBans() {
+  const r = await pool.query('SELECT user_id FROM users WHERE banned_at IS NOT NULL');
+  BANNED.clear();
+  for (const x of r.rows) BANNED.add(String(x.user_id));
+}
+
+// TESTER ALLOW-LIST (for DEV builds; leave TESTERS_ONLY unset/off in production).
+//   TESTERS_ONLY=on   only the Telegram ids in the `testers` table (plus ADMIN_TELEGRAM_IDS) may use the app; everyone else gets
+//                     403 NOT_TESTER on every /api call and the app shows the "testing is closed" card. Default: off = open to all.
+//   TESTERS_UNTIL     text shown on that card, e.g. 11.11   (default 11.11)
+//   TESTER_IDS        optional comma-separated ids added to the list on every boot (the admin panel can add / remove more)
+// Kept in memory like the ban list: the admin endpoints update it at once, a refresh every minute covers a second instance.
+const TESTERS_ONLY = String(process.env.TESTERS_ONLY || 'off').toLowerCase() === 'on';
+const TESTERS_UNTIL = String(process.env.TESTERS_UNTIL || '11.11').trim().slice(0, 24);
+const TESTERS = new Set();
+async function loadTesters() {
+  const r = await pool.query('SELECT user_id FROM testers');
+  TESTERS.clear();
+  for (const x of r.rows) TESTERS.add(String(x.user_id));
+}
+async function seedTesters() {
+  const ids = String(process.env.TESTER_IDS || '').split(/[\s,;]+/).filter((x) => /^\d{1,15}$/.test(x));
+  for (const id of ids) await pool.query(`INSERT INTO testers (user_id, note) VALUES ($1, 'TESTER_IDS') ON CONFLICT (user_id) DO NOTHING`, [id]);
+}
+
 function auth(req, res, next) {
   const user = verifyInitData(req.get('x-telegram-init-data'));
   if (!user) return res.status(401).json({ error: 'Invalid or expired Telegram session', code: 'UNAUTHORIZED' });
+  if (BANNED.has(String(user.id))) return res.status(403).json({ error: 'This account is banned', code: 'BANNED' });
+  if (TESTERS_ONLY && !TESTERS.has(String(user.id)) && !ADMIN_IDS.has(String(user.id))) return res.status(403).json({ error: 'Testing is closed for this account', code: 'NOT_TESTER', until: TESTERS_UNTIL });
   req.user = user;
   notifier.touch(user);
   next();
@@ -173,6 +204,9 @@ async function initDatabase() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_last_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS promo_allowed BOOLEAN;          -- NULL = automatic rule, true = always allowed, false = blocked
     ALTER TABLE users ADD COLUMN IF NOT EXISTS ton_paid NUMERIC(18,4) NOT NULL DEFAULT 0;
+    CREATE TABLE IF NOT EXISTS testers (user_id BIGINT PRIMARY KEY, note TEXT, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW());   -- the tester allow-list (see TESTERS_ONLY)
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ;           -- NULL = fine, a date = banned (see /admin/users/:id/ban)
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_note TEXT;
     CREATE INDEX IF NOT EXISTS idx_prizes_user_id ON prizes (user_id);
 
     CREATE TABLE IF NOT EXISTS promocodes (
@@ -197,6 +231,10 @@ async function initDatabase() {
       stars BIGINT NOT NULL DEFAULT 0, coins BIGINT NOT NULL DEFAULT 0,
       ref TEXT UNIQUE, meta JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger (user_id, id DESC);
+    CREATE TABLE IF NOT EXISTS referrals (
+      invitee_id BIGINT PRIMARY KEY, inviter_id BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), rewarded_at TIMESTAMPTZ, reward_stars BIGINT);
+    CREATE INDEX IF NOT EXISTS idx_referrals_inviter ON referrals (inviter_id, created_at DESC);
   `);
   await pool.query('ALTER TABLE promocodes ADD COLUMN IF NOT EXISTS open_to_all BOOLEAN NOT NULL DEFAULT false');
   const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM promocodes');
@@ -329,6 +367,50 @@ async function requireSubscription(userId) {
 }
 
 // ---------------------------------------------------------------------------
+// Referrals. An invite link is  <REFERRAL_LINK_BASE>?startapp=ref_<inviter id>.  The friend's first /api/me stores
+// the link, and only if that account did not exist before (never opened the app / never touched the bot). The inviter
+// gets REFERRAL_PERCENT % of that friend's FIRST real top-up, once. Later top-ups pay nothing.
+// ---------------------------------------------------------------------------
+const num = (v, d) => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : d);
+const REF = {
+  base: String(process.env.REFERRAL_LINK_BASE || (CFG.referral || {}).linkBase || 'https://t.me/VoidGiftsOfficialBot/app').replace(/\/$/, ''),
+  percent: Math.min(100, Math.max(0, num(process.env.REFERRAL_PERCENT, num((CFG.referral || {}).percent, 10)))),
+  maxRewards: Math.max(1, Math.trunc(num(process.env.REFERRAL_MAX_REWARDS, num((CFG.referral || {}).maxRewardsPerInviter, 200)))),
+};
+const refLink = (id) => `${REF.base}?startapp=ref_${id}`;
+
+// Called inside the friend's /api/me transaction. Silent when anything doesn't fit.
+async function attachReferral(c, tgUser, wasNew) {
+  const m = /^ref_(\d{1,15})$/.exec(tgUser.start_param || '');
+  if (!m || m[1] === String(tgUser.id) || BANNED.has(m[1]) || !REF.percent || !wasNew) return;
+  if ((await c.query('SELECT 1 FROM referrals WHERE invitee_id = $1', [tgUser.id])).rowCount) return;
+  // only brand-new accounts (row did not exist before this call); the checks below are a second safety net
+  if ((await c.query('SELECT 1 FROM ledger WHERE user_id = $1 LIMIT 1', [tgUser.id])).rowCount) return;
+  if ((await c.query('SELECT 1 FROM prizes WHERE user_id = $1 LIMIT 1', [tgUser.id])).rowCount) return;
+  if (!(await c.query('SELECT 1 FROM users WHERE user_id = $1', [m[1]])).rowCount) return;                      // inviter must be a real player
+  if ((await c.query('SELECT 1 FROM referrals WHERE invitee_id = $1 AND inviter_id = $2', [m[1], tgUser.id])).rowCount) return;   // no A<->B loops
+  await c.query('INSERT INTO referrals (invitee_id, inviter_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [tgUser.id, m[1]]);
+}
+
+// Called inside the transaction that credits a purchase. `topup` = Stars just bought. Pays the inviter once,
+// from the friend's first top-up only (rewarded_at is set even if the amount rounds to 0).
+async function rewardReferral(c, inviteeId, topup) {
+  const r = (await c.query('SELECT inviter_id FROM referrals WHERE invitee_id = $1 AND rewarded_at IS NULL FOR UPDATE', [inviteeId])).rows[0];
+  if (!r || !(topup > 0)) return;
+  const inviter = String(r.inviter_id);
+  if (BANNED.has(inviter) || BANNED.has(String(inviteeId))) return;
+  const done = Number((await c.query('SELECT COUNT(*) AS n FROM referrals WHERE inviter_id = $1 AND rewarded_at IS NOT NULL', [inviter])).rows[0].n);
+  if (done >= REF.maxRewards) return;
+  const reward = Math.floor(topup * REF.percent / 100);
+  await c.query('UPDATE referrals SET rewarded_at = NOW(), reward_stars = $2 WHERE invitee_id = $1', [inviteeId, reward]);
+  if (reward <= 0) return;
+  await c.query('UPDATE users SET stars = stars + $2, updated_at = NOW() WHERE user_id = $1', [inviter, reward]);
+  await c.query(`INSERT INTO ledger (user_id, kind, stars, ref, meta) VALUES ($1,'referral',$2,$3,$4) ON CONFLICT (ref) DO NOTHING`,
+    [inviter, reward, `referral:${inviteeId}`, JSON.stringify({ invitee: String(inviteeId), topup })]);
+  console.log(`🤝 referral: ${inviter} earned ${reward} Stars (${REF.percent}% of ${topup}) for ${inviteeId}`);
+}
+
+// ---------------------------------------------------------------------------
 // External credits: Telegram Stars + TON purchases confirmed by the other services
 // ---------------------------------------------------------------------------
 const lastCreditPoll = new Map();
@@ -367,6 +449,7 @@ async function claimExternalCredits(tgUser, initData) {
         // TON purchases count toward promocode access (TON value = Stars x tonPerStar, the same rate as the deposit packages).
         const tonPaid = Math.round(tonStars * Number((CFG.promoAccess || {}).tonPerStar || 0.00932) * 10000) / 10000;
         if (total) await c.query('UPDATE users SET stars = stars + $2, ton_paid = ton_paid + $3, updated_at = NOW() WHERE user_id = $1', [tgUser.id, total, tonPaid]);
+        if (total) await rewardReferral(c, tgUser.id, total);
         return total;
       });
     } catch (err) {
@@ -470,7 +553,11 @@ async function loadState(userId) {
 }
 
 app.get('/api/me', auth, limit('me', 40, 10000), wrap(async (req, res) => {
-  await tx((c) => lockUser(c, req.user));
+  await tx(async (c) => {
+    const wasNew = !(await c.query('SELECT 1 FROM users WHERE user_id = $1', [req.user.id])).rowCount;
+    await lockUser(c, req.user);
+    await attachReferral(c, req.user, wasNew);
+  });
   const last = lastCreditPoll.get(req.user.id) || 0;
   let credited = 0;
   if (Date.now() - last > 15000) {
@@ -478,6 +565,21 @@ app.get('/api/me', auth, limit('me', 40, 10000), wrap(async (req, res) => {
     credited = await claimExternalCredits(req.user, req.get('x-telegram-init-data'));
   }
   res.set('Cache-Control', 'no-store').json({ ...(await loadState(req.user.id)), credited });
+}));
+
+// Earn tab: the player's invite link, reward rules and who they invited.
+app.get('/api/referral', auth, limit('referral', 20, 10000), wrap(async (req, res) => {
+  const id = req.user.id;
+  const t = (await pool.query(
+    `SELECT COUNT(*)::int AS invited, COUNT(rewarded_at)::int AS rewarded, COALESCE(SUM(reward_stars),0)::bigint AS earned FROM referrals WHERE inviter_id = $1`, [id])).rows[0];
+  const list = (await pool.query(
+    `SELECT r.created_at, r.rewarded_at, r.reward_stars, u.first_name FROM referrals r LEFT JOIN users u ON u.user_id = r.invitee_id
+      WHERE r.inviter_id = $1 ORDER BY r.created_at DESC LIMIT 50`, [id])).rows;
+  res.set('Cache-Control', 'no-store').json({
+    link: refLink(id), percent: REF.percent, max_rewards: REF.maxRewards,
+    invited: t.invited, rewarded: t.rewarded, earned: Number(t.earned),
+    list: list.map((x) => ({ name: String(x.first_name || '').slice(0, 24) || null, joined_at: x.created_at, rewarded: !!x.rewarded_at, stars: x.reward_stars ? Number(x.reward_stars) : 0 })),
+  });
 }));
 
 // Called right after a purchase: collects Stars as soon as the payment service has them.
@@ -832,6 +934,54 @@ app.post('/admin/users/:id/grant', adminAuth, wrap(async (req, res) => {
     res.json({ user_id: req.params.id, stars: Number(u.stars), coins: Number(u.coins), prize_id });
   } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
 }));
+// Tester allow-list. Add / remove testers, see the list. Works whether or not TESTERS_ONLY is on, so you can prepare the list first.
+app.get('/admin/testers', adminAuth, wrap(async (req, res) => {
+  const r = await pool.query(`SELECT t.user_id, t.note, t.added_at, u.username, u.first_name FROM testers t LEFT JOIN users u ON u.user_id = t.user_id ORDER BY t.added_at DESC LIMIT 1000`);
+  res.json({ enforced: TESTERS_ONLY, until: TESTERS_UNTIL, count: r.rowCount, testers: r.rows });
+}));
+app.post('/admin/testers', adminAuth, wrap(async (req, res) => {
+  const b = req.body || {};
+  const raw = Array.isArray(b.ids) ? b.ids.join(' ') : String(b.ids ?? b.user_id ?? '');
+  const ids = [...new Set(raw.split(/[\s,;]+/).filter(Boolean))];
+  if (!ids.length) throw fail(400, 'NO_IDS', 'Give at least one Telegram id');
+  if (ids.length > 500) throw fail(400, 'TOO_MANY', 'At most 500 ids at a time');
+  const bad = ids.filter((x) => !/^\d{1,15}$/.test(x));
+  if (bad.length) throw fail(400, 'BAD_ID', 'Not a Telegram id: ' + bad.slice(0, 5).join(', '));
+  const note = typeof b.note === 'string' ? b.note.trim().slice(0, 200) || null : null;
+  for (const id of ids) {
+    await pool.query(`INSERT INTO testers (user_id, note) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET note = COALESCE($2, testers.note)`, [id, note]);
+    TESTERS.add(id);
+  }
+  console.log('🧪 testers added:', ids.join(', '));
+  res.json({ added: ids.length, count: TESTERS.size });
+}));
+app.post('/admin/testers/remove', adminAuth, wrap(async (req, res) => {
+  const id = String((req.body || {}).id ?? '');
+  if (!/^\d{1,15}$/.test(id)) throw fail(400, 'BAD_ID', 'Bad user id');
+  const r = await pool.query('DELETE FROM testers WHERE user_id = $1', [id]);
+  TESTERS.delete(id);
+  console.log('🧪 tester removed:', id);
+  res.json({ removed: r.rowCount, count: TESTERS.size });
+}));
+// Ban / unban an account. Banned users get 403 BANNED on every /api call and the app shows the ban screen.
+// Nothing is deleted: balances and gifts stay as they are, so an unban restores everything.
+app.post('/admin/users/:id/ban', adminAuth, wrap(async (req, res) => {
+  if (!/^\d{1,15}$/.test(req.params.id)) throw fail(400, 'BAD_ID', 'Bad user id');
+  const b = req.body || {};
+  if (typeof b.banned !== 'boolean') throw fail(400, 'BAD_VALUE', 'banned must be true or false');
+  const note = b.banned && typeof b.note === 'string' ? b.note.trim().slice(0, 300) || null : null;
+  const r = await pool.query(
+    `INSERT INTO users (user_id, banned_at, ban_note) VALUES ($1, CASE WHEN $2::boolean THEN NOW() END, $3)
+     ON CONFLICT (user_id) DO UPDATE SET banned_at = CASE WHEN $2::boolean THEN COALESCE(users.banned_at, NOW()) END, ban_note = $3
+     RETURNING user_id, banned_at, ban_note`, [req.params.id, b.banned, note]);
+  if (b.banned) BANNED.add(String(req.params.id)); else BANNED.delete(String(req.params.id));
+  console.warn((b.banned ? '🔨 BAN ' : '✅ UNBAN ') + req.params.id + (note ? ' — ' + note : ''));
+  res.json({ user_id: req.params.id, banned: !!r.rows[0].banned_at, banned_at: r.rows[0].banned_at, note: r.rows[0].ban_note });
+}));
+app.get('/admin/bans', adminAuth, wrap(async (req, res) => {
+  const r = await pool.query('SELECT user_id, username, first_name, banned_at, ban_note FROM users WHERE banned_at IS NOT NULL ORDER BY banned_at DESC LIMIT 500');
+  res.json({ count: r.rowCount, bans: r.rows });
+}));
 app.get('/admin/users/:id', adminAuth, wrap(async (req, res) => {
   const u = (await pool.query('SELECT * FROM users WHERE user_id = $1', [req.params.id])).rows[0];
   const l = (await pool.query('SELECT * FROM ledger WHERE user_id = $1 ORDER BY id DESC LIMIT 30', [req.params.id])).rows;
@@ -865,7 +1015,12 @@ table{width:100%;border-collapse:collapse;margin-top:14px}th,td{text-align:left;
 <label>Open to everyone<select id="f_open"><option value="false">no (needs access)</option><option value="true">yes (free giveaway)</option></select></label><label>Enabled<select id="f_active"><option value="true">yes</option><option value="false">no</option></select></label><button id="save" class="ok">Save code</button></div></div>
 <div class="card"><b>Who can redeem promocodes</b> <small>Accounts unlock automatically after paying the required TON; use this to allow or block someone by hand.</small>
 <div class="row"><label>Telegram user id<input id="u_id" placeholder="123456789" style="min-width:180px"></label><button id="u_check">Check</button><button class="ok" id="u_allow">Allow</button><button class="danger" id="u_block">Block</button><button id="u_auto">Back to automatic</button><small id="u_msg"></small></div>
+<div class="row"><label>Ban note (optional, only you see it)<input id="u_note" placeholder="e.g. bot / multi-account" style="min-width:260px"></label><button class="danger" id="u_ban">Ban user</button><button class="ok" id="u_unban">Unban</button></div>
 <div class="row"><label>Allow many (ids separated by spaces / commas / new lines)<textarea id="u_bulk" rows="2" style="min-width:320px"></textarea></label><button class="ok" id="u_bulkgo">Allow all listed</button></div></div>
+<div class="card"><b>Testers (allowed-only list)</b> <small id="t_mode"></small>
+<div class="row"><label>Telegram ids to allow (spaces / commas / new lines)<textarea id="t_ids" rows="2" style="min-width:320px"></textarea></label><label>Note (optional)<input id="t_note" placeholder="e.g. tiktok creator" style="min-width:180px"></label><button class="ok" id="t_add">Add testers</button></div>
+<div class="row"><label>Remove one id<input id="t_rm_id" placeholder="123456789" style="min-width:180px"></label><button class="danger" id="t_rm">Remove</button><button id="t_list">Show list</button><small id="t_msg"></small></div>
+<table id="t_tbl"></table></div>
 <div class="card"><b>Give an account Stars / a gift</b> <small>For testing and support. Every grant is logged. The gift is added to their inventory as a normal prize (ready to claim).</small>
 <div class="row"><label>Telegram user id<input id="g_id" placeholder="123456789" style="min-width:180px"></label><label>Stars<input id="g_stars" type="number" min="0" value="0" style="width:100px"></label><label>Coins<input id="g_coins" type="number" min="0" value="0" style="width:100px"></label>
 <label>Gift<select id="g_gift"><option value="">— none —</option></select></label><button class="ok" id="g_go">Give</button><small id="g_msg"></small></div></div>
@@ -897,9 +1052,16 @@ const uid=()=>$('u_id').value.trim();
 const accTxt=a=>(a.allowed?'CAN redeem':'cannot redeem')+' ('+a.reason.replace('_',' ')+', paid '+a.paid_ton+' / '+a.required_ton+' TON)';
 $('u_check').onclick=async()=>{K=$('key').value.trim();try{const j=await api('GET','/admin/users/'+uid());umsg(j.user?accTxt(j.promo_access):'user not found',!j.user)}catch(e){umsg(e.message,1)}};
 for(const [id,v] of [['u_allow',true],['u_block',false],['u_auto',null]])$(id).onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+uid()+'/promo-access',{allowed:v});umsg(accTxt(j.access))}catch(e){umsg(e.message,1)}};
+for(const [id,v] of [['u_ban',true],['u_unban',false]])$(id).onclick=async()=>{K=$('key').value.trim();try{if(v&&!confirm('Ban user '+uid()+'? They will see the ban screen straight away.'))return;const j=await api('POST','/admin/users/'+uid()+'/ban',{banned:v,note:$('u_note').value});umsg(j.banned?'User '+j.user_id+' is BANNED':'User '+j.user_id+' is not banned')}catch(e){umsg(e.message,1)}};
 $('u_bulkgo').onclick=async()=>{K=$('key').value.trim();try{const ids=$('u_bulk').value.split(/[\\s,;]+/).filter(Boolean);const j=await api('POST','/admin/promo-access/bulk',{user_ids:ids,allowed:true});umsg('Allowed '+j.updated+' accounts')}catch(e){umsg(e.message,1)}};
 const gmsg=(t,bad)=>{$('g_msg').textContent=t;$('g_msg').style.color=bad?'#ff9db5':'#7dffb0'};
 $('g_go').onclick=async()=>{K=$('key').value.trim();try{const j=await api('POST','/admin/users/'+$('g_id').value.trim()+'/grant',{stars:+$('g_stars').value,coins:+$('g_coins').value,gift:$('g_gift').value});gmsg('Done. Balance now '+j.stars+' ⭐, '+j.coins+' coins'+(j.prize_id?'. Prize '+j.prize_id:''))}catch(e){gmsg(e.message,1)}};
+function esc(x){return String(x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function tmsg(t,e){var m=$('t_msg');m.textContent=t;m.style.color=e?'#ff9db5':'#7dffb0'}
+async function tload(){K=$('key').value.trim();try{var j=await api('GET','/admin/testers');$('t_mode').textContent=(j.enforced?'ENFORCED - only listed ids (and admins) can open the app. ':'NOT enforced (TESTERS_ONLY is off) - everyone can open the app. ')+j.count+' on the list.';$('t_tbl').innerHTML='<tr><th>ID</th><th>Name</th><th>Note</th><th>Added</th></tr>'+j.testers.map(function(x){return '<tr><td>'+x.user_id+'</td><td>'+esc((x.first_name||'')+(x.username?' @'+x.username:''))+'</td><td>'+esc(x.note||'')+'</td><td>'+new Date(x.added_at).toLocaleString()+'</td></tr>'}).join('');tmsg('')}catch(e){tmsg(e.message,1)}}
+$('t_list').onclick=tload;
+$('t_add').onclick=async()=>{K=$('key').value.trim();try{var j=await api('POST','/admin/testers',{ids:$('t_ids').value,note:$('t_note').value});$('t_ids').value='';await tload();tmsg('Added '+j.added+' tester(s)')}catch(e){tmsg(e.message,1)}};
+$('t_rm').onclick=async()=>{K=$('key').value.trim();try{if(!confirm('Remove '+$('t_rm_id').value.trim()+' from the testers?'))return;await api('POST','/admin/testers/remove',{id:$('t_rm_id').value.trim()});$('t_rm_id').value='';await tload();tmsg('Removed')}catch(e){tmsg(e.message,1)}};
 $('logout').onclick=async()=>{try{await api('POST','/admin/logout')}catch(e){}location.reload()};
 (async()=>{try{const r=await fetch('/admin/me',{credentials:'same-origin'});const j=await r.json();
  if(r.ok){$('signed').style.display='flex';$('who').textContent='Signed in as '+j.name+' (ID '+j.id+')';K='';load();return}
@@ -915,17 +1077,28 @@ const rocket = require('./rocket').createRocket({ pool, tx, addLedger, createGif
 rocket.routes(app, { auth, limit, wrap });
 // Deployed commit (Railway sets RAILWAY_GIT_COMMIT_SHA for GitHub deploys); shown in the app's version tag.
 publicConfig.version = { commit: String(process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || '').slice(0, 7) || null };
+publicConfig.referral = { percent: REF.percent };
 publicConfig.rocket = rocket.publicConfig();
 const battle = require('./battle').createBattle({ pool, tx, addLedger, createGift, CFG, NFT_SET, fail, requireSubscription, nftPrice: (n) => convertValues[n] || 0 });
 battle.routes(app, { auth, limit, wrap });
 publicConfig.battle = battle.publicConfig();
+const mines = require('./mines').createMines({ pool, tx, addLedger, bal, CFG, fail, requireSubscription });
+mines.routes(app, { auth, limit, wrap });
+publicConfig.mines = mines.publicConfig();
 if (DEMO_MODE) { publicConfig.demoMode = true; console.warn('🧪 DEMO_MODE is ON — clients can force NFT wins. Never enable this in production.'); }
 
 (async () => {
   try {
     await initDatabase();
+    await loadBans();
+    await seedTesters();
+    await loadTesters();
+    console.log(TESTERS_ONLY ? `🔒 TESTERS_ONLY is ON: ${TESTERS.size} tester(s) on the list + admins (card text: until ${TESTERS_UNTIL})` : '🔓 TESTERS_ONLY is off: the app is open to everyone');
+    setInterval(() => loadBans().catch((e) => console.error('loadBans failed:', e.message)), 60000).unref();
+    setInterval(() => loadTesters().catch((e) => console.error('loadTesters failed:', e.message)), 60000).unref();
     await rocket.init();
     await battle.init();
+    await mines.init();
     await notifier.init();
     app.listen(PORT, () => {
       if (!BOT_URL) console.error('🚨 BOT_URL is not set — Telegram Stars purchases will NOT be delivered to players. Set BOT_URL to the main bot (VGServers) URL.');
