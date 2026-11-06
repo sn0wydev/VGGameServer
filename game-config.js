@@ -25,6 +25,11 @@ module.exports = {
   //  - A single code can be flagged "Open to everyone" in the panel for a public giveaway (blocked players are still blocked).
   promoAccess: { requirePayment: true, minTonPaid: 2, tonPerStar: 0.00932 },
 
+  // Referral program (Earn tab). The inviter gets rewardStars once an invited friend's total purchases reach minDepositStars
+  // (the 1-Star package can't be used to farm it). Env vars override these per environment:
+  //   REFERRAL_LINK_BASE, REFERRAL_REWARD_STARS, REFERRAL_MIN_DEPOSIT_STARS, REFERRAL_MAX_REWARDS (rewards one inviter can earn in total)
+  referral: { linkBase: 'https://t.me/VoidGiftsOfficialBot/app', percent: 10, maxRewardsPerInviter: 200 },
+
   // Allowed multipliers on paid wheels (N independent spins, paid N x price).
   multipliers: [1, 10, 100],
 
@@ -98,6 +103,18 @@ module.exports = {
     crashPauseSeconds: 4,
     maxUpgradeValue: 4000, // NFT stakes only upgrade into NFTs worth up to this many Stars
     nftTiers: null,        // null = all NFTs in nftGifts; or list the ones you actually hold
+  },
+
+  // Mines (see mines.js). KILL SWITCH: set the Railway variable MINES=off (or enabled:false below) and redeploy: every Mines route stops, the app hides it, unfinished games are refunded.
+  mines: {
+    enabled: true,
+    minBet: 50,
+    maxBet: 20000,
+    maxMultiplier: 100,    // a game never pays more than bet x this; reaching it cashes out automatically. Lower = smaller jackpots (rtp for players who stop earlier is unchanged)
+    edge: 0.90,            // 0.90 = 10% house edge. NOTE: with few mines the first tile pays under 1.00x at this edge (1 mine: 0.93x).
+    minMines: 1,
+    maxMines: 24,
+    maxPayoutStars: 200000,
   },
 
   // Gift Battle (see battle.js). Remove this block to use defaults; env BATTLE=off disables it.
