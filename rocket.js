@@ -104,6 +104,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
       serverNow: now, phase: r ? r.phase : 'bet', roundId: r ? r.id : 0, hash: r ? r.hash : null,
       betEndsAt: r ? r.betEndsAt : 0, flyStartedAt: r ? r.flyStartedAt : 0,
       crashAt: crashed ? r.crashAt : null, secret: crashed ? r.secret : null,
+      edge: R.edge, maxMult: R.maxMultiplier,          // public, so the crash point can be recomputed from the secret
       history,
       bets: r ? [...r.bets.values()].map((b) => ({ n: b.name, k: b.kind, a: b.amount || null, i: b.item || null, s: b.status === 'cashing' ? 'active' : b.status, x: b.cashAt || null, me: b.userId === userId })) : [],
       me: r && userId ? myBetView(r.bets.get(userId)) : null,
@@ -114,6 +115,9 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
     for (const [res, c] of clients) { try { res.write(`data: ${JSON.stringify(snapshot(c.userId))}\n\n`); } catch { clients.delete(res); } }
   }
   function broadcast() { if (!flushTimer) flushTimer = setTimeout(flush, 120); }
+  // The crash is time-critical: clients keep drawing the rising number until they hear about it, so it must never wait
+  // behind the 120 ms batching timer nor behind the database work of settling every bet.
+  function flushNow() { clearTimeout(flushTimer); flushTimer = null; flush(); }
 
   // ---- database ----------------------------------------------------------------------
   async function init() {
@@ -170,6 +174,10 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
         if (b.auto && b.auto < round.crashAt) round.timers.push(setTimeout(() => cashAuto(b).catch((e) => console.error('rocket auto cash-out:', e.message)), Math.ceil((Math.log(b.auto) / K) * 1000)));
       }
       round.timers.push(setTimeout(() => doCrash().catch((e) => console.error('🚨 rocket crash handling failed:', e)), crashMs));
+      // Heartbeat while flying: a tiny comment line every 400 ms. Between bets and cash-outs the stream is otherwise silent,
+      // so a client could not tell "nothing happened" from "my connection stalled" and kept the multiplier climbing past the
+      // real crash point. With the heartbeat it freezes the number as soon as the beats stop.
+      round.timers.push(setInterval(() => { for (const res of clients.keys()) { try { res.write(': hb\n\n'); } catch { clients.delete(res); } } }, 400));
       broadcast();
     } catch (e) { console.error('🚨 rocket startFlight:', e); setTimeout(newRound, 5000); }
   }
@@ -178,6 +186,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
     const r = round;
     r.phase = 'crash';
     r.timers.forEach(clearTimeout);
+    flushNow();                                           // tell every client RIGHT NOW (bets are settled below; a second broadcast follows)
     await Promise.allSettled([...inflight]);
     for (const b of r.bets.values()) {
       if (b.status !== 'active') continue;
@@ -320,7 +329,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
       const id = Number(req.params.id);
       const row = Number.isSafeInteger(id) ? (await pool.query('SELECT id, hash, secret, crash_at, crashed_at FROM rocket_rounds WHERE id = $1', [id])).rows[0] : null;
       if (!row) throw fail(404, 'NOT_FOUND', 'Unknown round');
-      res.json({ id: Number(row.id), hash: row.hash, ...(row.crashed_at ? { secret: row.secret, crash_at: Number(row.crash_at) } : {}) });
+      res.json({ id: Number(row.id), hash: row.hash, edge: R.edge, max_multiplier: R.maxMultiplier, ...(row.crashed_at ? { secret: row.secret, crash_at: Number(row.crash_at) } : {}) });
     }));
   }
 
@@ -330,7 +339,7 @@ function createRocket({ pool, tx, addLedger, createGift, bal, CFG, NFT_SET, fail
     newRound().catch((e) => { console.error('🚨 rocket could not start:', e); started = false; });
   }
 
-  const publicConfig = () => ({ enabled: R.enabled, minBet: R.minBet, maxBet: R.maxBet, growth: R.growth, maxMultiplier: R.maxMultiplier, betSeconds: R.betSeconds, giftTiers, nftTiers });
+  const publicConfig = () => ({ enabled: R.enabled, minBet: R.minBet, maxBet: R.maxBet, growth: R.growth, maxMultiplier: R.maxMultiplier, betSeconds: R.betSeconds, giftTiers, nftTiers, get values() { const v = {}; for (const t of giftTiers) v[t.n] = t.v; return v; } });
 
   return { init, start, routes, publicConfig, crashFromSecret, outcome, enabled: R.enabled };
 }
