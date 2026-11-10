@@ -25,6 +25,9 @@ module.exports = {
   //  - A single code can be flagged "Open to everyone" in the panel for a public giveaway (blocked players are still blocked).
   promoAccess: { requirePayment: true, minTonPaid: 2, tonPerStar: 0.00932 },
 
+  // Referrals: the inviter gets `percent`% of a new friend's FIRST top-up, once. Overridable with REFERRAL_PERCENT / REFERRAL_LINK_BASE / REFERRAL_MAX_REWARDS.
+  referral: { linkBase: 'https://t.me/VoidGiftsOfficialBot/app', percent: 10, maxRewardsPerInviter: 200 },
+
   // Allowed multipliers on paid wheels (N independent spins, paid N x price).
   multipliers: [1, 10, 100],
 
@@ -178,6 +181,21 @@ module.exports = {
       { id: 'voidGiftSocks', type: 'gift', value: 'Socks', chance: 0.3500 },
       { id: 'voidGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.0600 }
       ],
+      // Black Friday odds: used instead of "prizes" only while the event runs (see event.js). Same ids, must add up to 100.
+      eventPrizes: [
+      { id: 'voidStars5', type: 'stars', value: 5, chance: 38.1391 },
+      { id: 'voidStars10', type: 'stars', value: 10, chance: 22.8702 },
+      { id: 'voidStars25', type: 'stars', value: 25, chance: 11.6324 },
+      { id: 'voidStars50', type: 'stars', value: 50, chance: 6.9754 },
+      { id: 'voidStars100', type: 'stars', value: 100, chance: 4.1828 },
+      { id: 'voidGiftHeart', type: 'gift', value: 'Heart', chance: 8.0000 },
+      { id: 'voidGiftBear', type: 'gift', value: 'Bear', chance: 3.0000 },
+      { id: 'voidGiftCake', type: 'gift', value: 'Cake', chance: 1.5000 },
+      { id: 'voidGiftRocket', type: 'gift', value: 'Rocket', chance: 1.5000 },
+      { id: 'voidGiftLollipop', type: 'gift', value: 'Lollipop', chance: 1.2088 },
+      { id: 'voidGiftSocks', type: 'gift', value: 'Socks', chance: 0.8462 },
+      { id: 'voidGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.1451 }
+      ],
       preview: [
       { id: 'voidStars5', type: 'stars', value: 5, chance: 20.8200 },
       { id: 'voidStars10', type: 'stars', value: 10, chance: 16.5402 },
@@ -212,6 +230,24 @@ module.exports = {
       { id: 'furryGiftStarNotepad', type: 'gift', value: 'Star Notepad', chance: 0.8000 },
       { id: 'furryGiftCalendar', type: 'gift', value: 'Calendar', chance: 0.7000 },
       { id: 'furryGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.3000 }
+      ],
+      // Black Friday odds: used instead of "prizes" only while the event runs (see event.js). Same ids, must add up to 100.
+      eventPrizes: [
+      { id: 'furryStars10', type: 'stars', value: 10, chance: 27.8649 },
+      { id: 'furryStars25', type: 'stars', value: 25, chance: 16.9943 },
+      { id: 'furryStars50', type: 'stars', value: 50, chance: 11.6909 },
+      { id: 'furryStars100', type: 'stars', value: 100, chance: 8.0426 },
+      { id: 'furryStars150', type: 'stars', value: 150, chance: 6.4619 },
+      { id: 'furryStars300', type: 'stars', value: 300, chance: 4.4454 },
+      { id: 'furryGiftRose', type: 'gift', value: 'Rose', chance: 6.0000 },
+      { id: 'furryGiftCake', type: 'gift', value: 'Cake', chance: 5.0000 },
+      { id: 'furryGiftChampagne', type: 'gift', value: 'Champagne', chance: 4.0000 },
+      { id: 'furryGiftTrophy', type: 'gift', value: 'Trophy', chance: 2.5000 },
+      { id: 'furryGiftDiamond', type: 'gift', value: 'Diamond', chance: 2.5000 },
+      { id: 'furryGiftSocks', type: 'gift', value: 'Socks', chance: 1.5000 },
+      { id: 'furryGiftStarNotepad', type: 'gift', value: 'Star Notepad', chance: 1.3333 },
+      { id: 'furryGiftCalendar', type: 'gift', value: 'Calendar', chance: 1.1667 },
+      { id: 'furryGiftInstantRamen', type: 'gift', value: 'Instant Ramen', chance: 0.5000 }
       ],
       preview: [
       { id: 'furryStars10', type: 'stars', value: 10, chance: 14.7767 },
@@ -251,6 +287,24 @@ module.exports = {
       { id: 'hexGiftVintageCigar', type: 'gift', value: 'Vintage Cigar', chance: 0.3770 },
       { id: 'hexGiftKissedFrog', type: 'gift', value: 'Kissed Frog', chance: 0.3510 }
       ],
+      // Black Friday odds: used instead of "prizes" only while the event runs (see event.js). Same ids, must add up to 100.
+      eventPrizes: [
+      { id: 'hexStars25', type: 'stars', value: 25, chance: 21.9005 },
+      { id: 'hexStars50', type: 'stars', value: 50, chance: 16.8040 },
+      { id: 'hexStars100', type: 'stars', value: 100, chance: 12.8934 },
+      { id: 'hexStars250', type: 'stars', value: 250, chance: 9.0841 },
+      { id: 'hexStars500', type: 'stars', value: 500, chance: 6.9700 },
+      { id: 'hexStars1000', type: 'stars', value: 1000, chance: 5.3480 },
+      { id: 'hexGiftChampagne', type: 'gift', value: 'Champagne', chance: 4.0000 },
+      { id: 'hexGiftTrophy', type: 'gift', value: 'Trophy', chance: 4.0000 },
+      { id: 'hexGiftDiamond', type: 'gift', value: 'Diamond', chance: 4.0000 },
+      { id: 'hexGiftRing', type: 'gift', value: 'Ring', chance: 3.0000 },
+      { id: 'hexGiftLightSword', type: 'gift', value: 'Light Sword', chance: 4.8364 },
+      { id: 'hexGiftWitchHat', type: 'gift', value: 'Witch Hat', chance: 4.7454 },
+      { id: 'hexGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 0.8421 },
+      { id: 'hexGiftVintageCigar', type: 'gift', value: 'Vintage Cigar', chance: 0.8162 },
+      { id: 'hexGiftKissedFrog', type: 'gift', value: 'Kissed Frog', chance: 0.7599 }
+      ],
       preview: [
       { id: 'hexStars25', type: 'stars', value: 25, chance: 13.5851 },
       { id: 'hexStars50', type: 'stars', value: 50, chance: 12.0584 },
@@ -286,6 +340,22 @@ module.exports = {
       { id: 'astralGiftLuckyLocket', type: 'gift', value: 'Lucky Locket', chance: 2.1450 },
       { id: 'astralGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 1.1970 },
       { id: 'astralGiftAstralShard', type: 'gift', value: 'Astral Shard', chance: 0.4370 }
+      ],
+      // Black Friday odds: used instead of "prizes" only while the event runs (see event.js). Same ids, must add up to 100.
+      eventPrizes: [
+      { id: 'astralStars50', type: 'stars', value: 50, chance: 22.8345 },
+      { id: 'astralStars100', type: 'stars', value: 100, chance: 16.9158 },
+      { id: 'astralStars250', type: 'stars', value: 250, chance: 11.3776 },
+      { id: 'astralStars500', type: 'stars', value: 500, chance: 8.4287 },
+      { id: 'astralStars1000', type: 'stars', value: 1000, chance: 6.2439 },
+      { id: 'astralStars2500', type: 'stars', value: 2500, chance: 4.1996 },
+      { id: 'astralGiftDiamond', type: 'gift', value: 'Diamond', chance: 5.0000 },
+      { id: 'astralGiftTrophy', type: 'gift', value: 'Trophy', chance: 4.0000 },
+      { id: 'astralGiftRing', type: 'gift', value: 'Ring', chance: 4.0000 },
+      { id: 'astralGiftInputKey', type: 'gift', value: 'Input Key', chance: 9.1242 },
+      { id: 'astralGiftLuckyLocket', type: 'gift', value: 'Lucky Locket', chance: 4.4704 },
+      { id: 'astralGiftVoodooDoll', type: 'gift', value: 'Voodoo Doll', chance: 2.4946 },
+      { id: 'astralGiftAstralShard', type: 'gift', value: 'Astral Shard', chance: 0.9107 }
       ],
       preview: [
       { id: 'astralStars50', type: 'stars', value: 50, chance: 14.7034 },
