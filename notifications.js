@@ -168,7 +168,7 @@ function createNotifier({ pool, botToken, dailyMs, env = process.env, log = cons
               AND daily_last_at > NOW() - INTERVAL '3 days'
               AND (daily_notified_at IS NULL OR daily_notified_at < daily_last_at)
             ORDER BY daily_last_at LIMIT 100 FOR UPDATE SKIP LOCKED)
-         RETURNING user_id, first_name, lang_pref AS lang`, [String(dailyMs)]);
+         RETURNING user_id, first_name, lang_pref AS lang`, [String(typeof dailyMs === 'function' ? dailyMs() : dailyMs)]);
       for (const u of due.rows) {
         if (await deliver(u, 'daily', 0)) out.daily++;
         await new Promise((r) => setTimeout(r, 50));
